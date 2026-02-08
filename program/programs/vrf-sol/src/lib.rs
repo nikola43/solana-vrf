@@ -83,4 +83,16 @@ pub mod vrf_sol {
     pub fn close_request(ctx: Context<CloseRequest>, request_id: u64) -> Result<()> {
         instructions::close_request::handler(ctx, request_id)
     }
+
+    /// Submit a new randomness request with a callback program.
+    ///
+    /// Same as `request_randomness` but stores a callback program on the request.
+    /// After fulfillment, the oracle can CPI into the callback program with the
+    /// randomness output and auto-transition to Consumed status.
+    pub fn request_randomness_with_callback(
+        ctx: Context<RequestRandomnessWithCallback>,
+        seed: [u8; 32],
+    ) -> Result<()> {
+        instructions::request_with_callback::handler(ctx, seed)
+    }
 }

@@ -1,12 +1,14 @@
 //! Fulfillment engine — consumes randomness request events and submits
 //! on-chain fulfillment transactions with Ed25519 signature proofs.
 //!
-//! Each fulfillment transaction contains two instructions:
-//! 1. A native Ed25519 signature-verify instruction (proof of VRF output).
-//! 2. The `fulfill_randomness` Anchor instruction on the VRF program.
+//! Each fulfillment transaction contains two instructions (optionally three
+//! with a priority fee):
+//! 1. (Optional) A `set_compute_unit_price` instruction for priority fees.
+//! 2. A native Ed25519 signature-verify instruction (proof of VRF output).
+//! 3. The `fulfill_randomness` Anchor instruction on the VRF program.
 //!
-//! Transactions are retried with exponential backoff on `BlockhashNotFound`
-//! errors (common during RPC congestion).
+//! Requests are fulfilled concurrently up to the configured concurrency limit,
+//! with exponential backoff on `BlockhashNotFound` errors.
 
 use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -18,18 +20,18 @@ use solana_sdk::sysvar;
 use solana_sdk::transaction::Transaction;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, instrument, warn};
 
 use crate::config::AppConfig;
 use crate::listener::RandomnessRequestedEvent;
+use crate::metrics::Metrics;
 use crate::vrf::compute_randomness;
 
-/// Maximum number of send-and-confirm attempts per fulfillment.
-const MAX_RETRIES: u32 = 5;
-/// Initial delay before the first retry (doubles each attempt).
-const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Known non-retryable Anchor error codes.
+const ERROR_REQUEST_NOT_PENDING: u32 = 6000;
+const ERROR_UNAUTHORIZED: u32 = 6009;
 
 /// Compute the Anchor instruction discriminator for `fulfill_randomness`:
 /// first 8 bytes of `sha256("global:fulfill_randomness")`.
@@ -43,63 +45,96 @@ fn fulfill_discriminator() -> [u8; 8] {
     disc
 }
 
+/// Check if an error string contains a known non-retryable error.
+fn is_non_retryable(err_str: &str) -> bool {
+    // Check for Anchor error codes
+    let non_retryable_codes = [
+        format!("0x{:x}", ERROR_REQUEST_NOT_PENDING), // "0x1770"
+        format!("0x{:x}", ERROR_UNAUTHORIZED),         // "0x1779"
+    ];
+    for code in &non_retryable_codes {
+        if err_str.contains(code) {
+            return true;
+        }
+    }
+    // Also check for string-based error names
+    err_str.contains("RequestNotPending")
+        || err_str.contains("Unauthorized")
+        || err_str.contains("AccountNotInitialized")
+        || err_str.contains("already in use")
+}
+
 /// Main fulfiller loop.
 ///
-/// Reads [`RandomnessRequestedEvent`]s from the channel, computes the VRF
-/// output, builds the transaction, and submits it on-chain. Known non-retryable
-/// errors (Unauthorized, RequestNotPending, AccountNotInitialized) are logged
-/// as warnings and skipped.
+/// Reads [`RandomnessRequestedEvent`]s from the channel and spawns concurrent
+/// fulfillment tasks up to the configured concurrency limit.
 pub async fn run_fulfiller(
     config: AppConfig,
     mut rx: mpsc::Receiver<RandomnessRequestedEvent>,
     pending_count: Arc<AtomicU64>,
+    metrics: Arc<Metrics>,
 ) {
-    let rpc_client = RpcClient::new_with_commitment(
+    let rpc_client = Arc::new(RpcClient::new_with_commitment(
         config.rpc_url.clone(),
         CommitmentConfig::confirmed(),
-    );
+    ));
+
+    let semaphore = Arc::new(Semaphore::new(config.fulfillment_concurrency));
 
     while let Some(event) = rx.recv().await {
         pending_count.fetch_add(1, Ordering::Relaxed);
 
-        info!(
-            request_id = event.request_id,
-            requester = %event.requester,
-            slot = event.request_slot,
-            "Fulfilling randomness request"
-        );
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let rpc = rpc_client.clone();
+        let cfg = config.clone();
+        let pending = pending_count.clone();
+        let met = metrics.clone();
 
-        match fulfill_request(&rpc_client, &config, &event).await {
-            Ok(sig) => {
-                info!(
-                    request_id = event.request_id,
-                    signature = %sig,
-                    explorer = %format!("https://solscan.io/tx/{sig}?cluster=devnet"),
-                    "Fulfilled successfully"
-                );
-            }
-            Err(e) => {
-                let err_str = format!("{e:#}");
-                if err_str.contains("Unauthorized")
-                    || err_str.contains("RequestNotPending")
-                    || err_str.contains("AccountNotInitialized")
-                {
-                    warn!(
+        tokio::spawn(async move {
+            let _permit = permit; // held until task completes
+
+            info!(
+                request_id = event.request_id,
+                requester = %event.requester,
+                slot = event.request_slot,
+                "Fulfilling randomness request"
+            );
+
+            let start = Instant::now();
+
+            match fulfill_request(&rpc, &cfg, &event).await {
+                Ok(sig) => {
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    met.record_fulfillment(latency_ms);
+                    info!(
                         request_id = event.request_id,
-                        reason = %err_str,
-                        "Skipping request"
-                    );
-                } else {
-                    error!(
-                        request_id = event.request_id,
-                        error = %err_str,
-                        "Failed to fulfill"
+                        signature = %sig,
+                        latency_ms,
+                        explorer = %cfg.explorer_url(&sig),
+                        "Fulfilled successfully"
                     );
                 }
+                Err(e) => {
+                    let err_str = format!("{e:#}");
+                    if is_non_retryable(&err_str) {
+                        warn!(
+                            request_id = event.request_id,
+                            reason = %err_str,
+                            "Skipping request (non-retryable)"
+                        );
+                    } else {
+                        met.record_failure();
+                        error!(
+                            request_id = event.request_id,
+                            error = %err_str,
+                            "Failed to fulfill"
+                        );
+                    }
+                }
             }
-        }
 
-        pending_count.fetch_sub(1, Ordering::Relaxed);
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
     }
 
     info!("Fulfiller channel closed, shutting down");
@@ -133,16 +168,29 @@ async fn fulfill_request(
         &randomness,
     );
 
-    let mut retry_delay = INITIAL_RETRY_DELAY;
+    // Build instruction list
+    let mut instructions = Vec::with_capacity(3);
 
-    for attempt in 0..MAX_RETRIES {
+    // Prepend priority fee instruction if configured
+    if config.priority_fee_micro_lamports > 0 {
+        instructions.push(build_set_compute_unit_price_instruction(
+            config.priority_fee_micro_lamports,
+        ));
+    }
+
+    instructions.push(ed25519_ix);
+    instructions.push(fulfill_ix);
+
+    let mut retry_delay = Duration::from_millis(config.initial_retry_delay_ms);
+
+    for attempt in 0..config.max_retries {
         let blockhash = rpc_client
             .get_latest_blockhash()
             .await
             .context("failed to fetch latest blockhash")?;
 
         let tx = Transaction::new_signed_with_payer(
-            &[ed25519_ix.clone(), fulfill_ix.clone()],
+            &instructions,
             Some(&config.authority_keypair.pubkey()),
             &[config.authority_keypair.as_ref()],
             blockhash,
@@ -150,7 +198,7 @@ async fn fulfill_request(
 
         match rpc_client.send_and_confirm_transaction(&tx).await {
             Ok(sig) => return Ok(sig.to_string()),
-            Err(e) if e.to_string().contains("BlockhashNotFound") && attempt < MAX_RETRIES - 1 => {
+            Err(e) if e.to_string().contains("BlockhashNotFound") && attempt < config.max_retries - 1 => {
                 warn!(
                     attempt = attempt + 1,
                     delay = ?retry_delay,
@@ -163,7 +211,11 @@ async fn fulfill_request(
         }
     }
 
-    anyhow::bail!("max retries ({MAX_RETRIES}) exceeded for request_id={}", event.request_id)
+    anyhow::bail!(
+        "max retries ({}) exceeded for request_id={}",
+        config.max_retries,
+        event.request_id
+    )
 }
 
 /// Construct a native Ed25519 signature-verify instruction.
@@ -219,6 +271,24 @@ fn build_ed25519_instruction(
 
     Instruction {
         program_id: ed25519_program::id(),
+        accounts: vec![],
+        data,
+    }
+}
+
+/// Build a `SetComputeUnitPrice` instruction manually.
+///
+/// ComputeBudget program ID: `ComputeBudget111111111111111111111111111111`
+/// Instruction index 3 = SetComputeUnitPrice, data: [3u8, micro_lamports as u64 LE]
+fn build_set_compute_unit_price_instruction(micro_lamports: u64) -> Instruction {
+    let compute_budget_id: Pubkey = "ComputeBudget111111111111111111111111111111"
+        .parse()
+        .unwrap();
+    let mut data = Vec::with_capacity(9);
+    data.push(3u8); // SetComputeUnitPrice instruction index
+    data.extend_from_slice(&micro_lamports.to_le_bytes());
+    Instruction {
+        program_id: compute_budget_id,
         accounts: vec![],
         data,
     }

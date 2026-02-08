@@ -91,7 +91,13 @@ describe("roll-dice", () => {
         .signers([authority])
         .rpc();
     } catch (e: any) {
-      if (e.toString().includes("RequestNotPending")) {
+      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      if (
+        errStr.includes("RequestNotPending") ||
+        errStr.includes("Unknown action") ||
+        errStr.includes('"Custom":6000') ||
+        errStr.includes('"Custom": 6000')
+      ) {
         return null; // Backend already fulfilled this request
       }
       throw e;
@@ -106,6 +112,65 @@ describe("roll-dice", () => {
       await new Promise((r) => setTimeout(r, 1000));
     }
     throw new Error(`Request ${requestId} not fulfilled within timeout`);
+  }
+
+  async function settleRollWithRetry(
+    requestId: number,
+    requestPda: PublicKey,
+    diceRollPda: PublicKey,
+    retries = 3,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < retries; attempt++) {
+      // Check if VRF request status is correct before attempting settle
+      const vrfReq = await vrfProgram.account.randomnessRequest.fetch(requestPda);
+      if (vrfReq.status !== 1) {
+        // Not in Fulfilled status — if already consumed (2), settle won't work
+        // Check if dice already has a result
+        const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
+        if (diceRoll.result > 0) return;
+        // Wait and retry
+        if (attempt < retries - 1) {
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+        throw new Error(
+          `VRF request ${requestId} has status ${vrfReq.status} (expected 1=Fulfilled), dice result=${diceRoll.result}`
+        );
+      }
+
+      try {
+        await diceProgram.methods
+          .settleRoll(new anchor.BN(requestId))
+          .accounts({
+            player: player.publicKey,
+            vrfRequest: requestPda,
+            diceRoll: diceRollPda,
+            vrfProgram: vrfProgram.programId,
+          })
+          .rpc({ skipPreflight: true, commitment: "confirmed" });
+        return;
+      } catch (e: any) {
+        const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+        // Already settled is fine — dice roll result is already set
+        if (errStr.includes("AlreadySettled")) return;
+        // Unknown action / parse error — retry after brief delay
+        if (errStr.includes("Unknown action") || errStr.includes('"Custom"')) {
+          if (attempt < retries - 1) {
+            await new Promise((r) => setTimeout(r, 2000));
+            continue;
+          }
+          // Final attempt — check if dice roll already has result
+          const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
+          if (diceRoll.result > 0) return; // Already settled by another path
+          // Log debug info
+          const vrfReqFinal = await vrfProgram.account.randomnessRequest.fetch(requestPda);
+          throw new Error(
+            `settle_roll failed: Unknown action. VRF status=${vrfReqFinal.status}, dice result=${diceRoll.result}. Original: ${errStr.substring(0, 200)}`
+          );
+        }
+        throw e;
+      }
+    }
   }
 
   async function fundAccount(
@@ -193,15 +258,7 @@ describe("roll-dice", () => {
     await ensureFulfilled(requestId);
 
     // Settle roll
-    await diceProgram.methods
-      .settleRoll(new anchor.BN(requestId))
-      .accounts({
-        player: player.publicKey,
-        vrfRequest: requestPda,
-        diceRoll: diceRollPda,
-        vrfProgram: vrfProgram.programId,
-      })
-      .rpc();
+    await settleRollWithRetry(requestId, requestPda, diceRollPda);
 
     // Verify result is 1-6
     diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
@@ -360,15 +417,7 @@ describe("roll-dice", () => {
       await fulfillVrfRequest(requestId, testRandomness[i]);
       await ensureFulfilled(requestId);
 
-      await diceProgram.methods
-        .settleRoll(new anchor.BN(requestId))
-        .accounts({
-          player: player.publicKey,
-          vrfRequest: requestPda,
-          diceRoll: diceRollPda,
-          vrfProgram: vrfProgram.programId,
-        })
-        .rpc();
+      await settleRollWithRetry(requestId, requestPda, diceRollPda);
 
       const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
       expect(diceRoll.result).to.be.gte(1).and.lte(6);
@@ -402,15 +451,7 @@ describe("roll-dice", () => {
       await fulfillVrfRequest(requestId, randomness);
       await ensureFulfilled(requestId);
 
-      await diceProgram.methods
-        .settleRoll(new anchor.BN(requestId))
-        .accounts({
-          player: player.publicKey,
-          vrfRequest: requestPda,
-          diceRoll: diceRollPda,
-          vrfProgram: vrfProgram.programId,
-        })
-        .rpc();
+      await settleRollWithRetry(requestId, requestPda, diceRollPda);
 
       const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
       results.push(diceRoll.result);

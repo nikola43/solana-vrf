@@ -5,32 +5,80 @@
   <img src="https://img.shields.io/badge/TypeScript-black?logo=typescript&logoColor=3178C6&style=for-the-badge" alt="TypeScript" />
 </p>
 
-<h1 align="center">Solana VRF</h1>
+<h1 align="center">Moirae</h1>
 
 <p align="center">
   <strong>Verifiable Random Function oracle for Solana</strong><br/>
-  On-chain cryptographic randomness with Ed25519 signature proofs
+  On-chain cryptographic randomness with Ed25519 signature proofs<br/>
+  <em>Named after the Moirae (&Mu;&omicron;&iota;&rho;&alpha;&iota;) — the Greek goddesses of fate who spin the thread of destiny</em>
 </p>
 
 <p align="center">
+  <a href="#sdk">SDK</a> &bull;
   <a href="#architecture">Architecture</a> &bull;
   <a href="#programs">Programs</a> &bull;
   <a href="#getting-started">Getting Started</a> &bull;
   <a href="#integration-guide">Integration Guide</a> &bull;
-  <a href="#testing">Testing</a>
+  <a href="#testing">Testing</a> &bull;
+  <a href="docs/">Documentation</a>
 </p>
 
 ---
 
 ## Overview
 
-**solana-vrf** is a self-hosted VRF oracle system for Solana. It provides on-chain verifiable randomness through an HMAC-SHA256 + Ed25519 signature scheme:
+**Moirae** is a self-hosted VRF oracle system for Solana. It provides on-chain verifiable randomness through an HMAC-SHA256 + Ed25519 signature scheme:
 
 - An on-chain program accepts randomness requests and verifies fulfillment proofs using Solana's native Ed25519 precompile
 - An off-chain backend watches for requests in real-time and submits cryptographically signed fulfillment transactions
+- A TypeScript SDK makes integration effortless — request randomness in 3 lines of code
 - Consumer programs integrate via CPI to request and consume randomness
 
 No third-party dependencies. No token. Just math and signatures.
+
+## SDK
+
+Install the TypeScript SDK:
+
+```bash
+npm install @moirae-vrf/sdk @solana/web3.js
+```
+
+Get verifiable randomness in one call:
+
+```typescript
+import { Connection, Keypair } from "@solana/web3.js";
+import { MoiraeVrf } from "@moirae-vrf/sdk";
+
+const connection = new Connection("https://api.devnet.solana.com", "confirmed");
+const vrf = new MoiraeVrf(connection);
+
+// One call does everything: request → wait → consume → close
+const { randomness } = await vrf.getRandomness(payer);
+console.log("Random bytes:", Buffer.from(randomness).toString("hex"));
+```
+
+Need more control? Use the step-by-step API:
+
+```typescript
+const { requestId } = await vrf.requestRandomness(payer, seed);
+const { randomness } = await vrf.waitForFulfillment(requestId);
+await vrf.consumeRandomness(payer, requestId);
+await vrf.closeRequest(payer, requestId);
+```
+
+See the [SDK README](sdk/README.md) for full API reference and the [examples/](examples/) directory for runnable scripts.
+
+## Comparison
+
+| Feature | Moirae | Switchboard | ORAO | MagicBlock |
+|---------|-----------|-------------|------|------------|
+| **Cost** | < 0.001 SOL | ~0.002 SOL | 0.001 SOL | 0.0005 SOL |
+| **Speed** | ~1-2 slots | ~2-3 slots | ~2-3 slots | ~1 slot |
+| **Verification** | Ed25519 sig | TEE attestation | Multi-sig | Rollup proof |
+| **Self-hostable** | Yes | No | No | Partial |
+| **SDK** | TypeScript | TypeScript + Rust | TypeScript + Rust | TypeScript |
+| **Token required** | No | No | No | No |
 
 ## Architecture
 
@@ -57,6 +105,7 @@ No third-party dependencies. No token. Just math and signatures.
   │                │
   │  HTTP /health  │  HMAC-SHA256 + Ed25519
   │  HTTP /status  │  signature proof
+  │  HTTP /metrics │
   └────────────────┘
 ```
 
@@ -141,8 +190,8 @@ Rust service (`actix-web` + `tokio`) with three concurrent subsystems:
 | Subsystem | Role |
 |-----------|------|
 | **Listener** | WebSocket log subscription + startup `getProgramAccounts` catch-up scan |
-| **Fulfiller** | Builds Ed25519 + fulfill transactions, exponential backoff retry |
-| **HTTP** | `/health` (liveness) and `/status` (readiness + pending count) on `:8080` |
+| **Fulfiller** | Concurrent fulfillment with Ed25519 proofs, exponential backoff retry, optional priority fees |
+| **HTTP** | `/health` (liveness), `/status` (readiness), `/metrics` (JSON counters) on configurable port |
 
 ## Getting Started
 
@@ -187,7 +236,7 @@ The backend will:
 1. Scan for any pending requests that were missed while offline
 2. Subscribe to real-time events via WebSocket
 3. Automatically fulfill incoming randomness requests
-4. Serve health/status endpoints on port 8080
+4. Serve health/status/metrics endpoints on the configured port
 
 ### Environment Variables
 
@@ -196,8 +245,13 @@ The backend will:
 | `RPC_URL` | No | `http://127.0.0.1:8899` | Solana JSON-RPC endpoint |
 | `WS_URL` | No | `ws://127.0.0.1:8900` | Solana WebSocket endpoint |
 | `AUTHORITY_KEYPAIR_PATH` | No | `~/.config/solana/id.json` | Path to oracle signer keypair |
-| `HMAC_SECRET` | **Yes** | - | Hex-encoded secret for randomness derivation |
+| `HMAC_SECRET` | **Yes** | - | Secret for randomness derivation |
 | `PROGRAM_ID` | **Yes** | - | Deployed VRF program ID |
+| `CLUSTER` | No | `devnet` | Cluster name for explorer URLs |
+| `HTTP_PORT` | No | `8080` | HTTP server port |
+| `MAX_RETRIES` | No | `5` | Max retry attempts per fulfillment |
+| `PRIORITY_FEE_MICRO_LAMPORTS` | No | `0` | Priority fee per compute unit |
+| `FULFILLMENT_CONCURRENCY` | No | `4` | Max concurrent fulfillment tasks |
 
 ## Integration Guide
 
@@ -249,7 +303,7 @@ vrf_sol::cpi::consume_randomness(cpi_ctx, request_id)?;
 let value = u64::from_le_bytes(randomness[0..8].try_into().unwrap());
 ```
 
-See `program/programs/roll-dice/src/lib.rs` for a complete working example.
+See `program/programs/roll-dice/src/lib.rs` for a complete working example, or the [full integration guide](docs/integration-guide.md) for detailed documentation.
 
 ## Testing
 
@@ -283,6 +337,13 @@ cd backend
 cargo test
 ```
 
+### SDK Build
+
+```bash
+cd sdk
+npm install && npm run build
+```
+
 ### Linting
 
 ```bash
@@ -308,15 +369,44 @@ solana-vrf/
 │   │       └── src/lib.rs              # DiceRoll, request_roll, settle_roll
 │   ├── tests/                  # TypeScript test suite
 │   └── Anchor.toml
-├── backend/                    # Off-chain oracle service
+├── sdk/                        # TypeScript SDK (@moirae-vrf/sdk)
 │   └── src/
-│       ├── main.rs             # Entrypoint, HTTP server
+│       ├── client.ts           # High-level MoiraeVrf class
+│       ├── instructions.ts     # Low-level instruction builders
+│       ├── accounts.ts         # Account deserialization
+│       ├── pda.ts              # PDA derivation
+│       ├── constants.ts        # Program IDs, discriminators
+│       ├── types.ts            # TypeScript types
+│       └── utils.ts            # waitForFulfillment, addPriorityFee
+├── examples/                   # Runnable SDK examples
+│   ├── request-randomness.ts   # Basic request flow
+│   ├── dice-game.ts            # CPI dice game integration
+│   └── batch-requests.ts       # Concurrent requests
+├── backend/                    # Off-chain oracle service
+│   ├── Dockerfile              # Production container
+│   └── src/
+│       ├── main.rs             # Entrypoint, HTTP server, graceful shutdown
 │       ├── config.rs           # Environment-based configuration
 │       ├── listener.rs         # WebSocket event listener + catch-up scan
-│       ├── fulfiller.rs        # Transaction builder + retry logic
+│       ├── fulfiller.rs        # Concurrent fulfillment + retry logic
+│       ├── metrics.rs          # Atomic counters for monitoring
 │       └── vrf.rs              # HMAC-SHA256 randomness computation
-└── CLAUDE.md
+├── docs/                       # Documentation
+│   ├── architecture.md         # System design, trust model, comparison
+│   ├── integration-guide.md    # SDK + CPI integration reference
+│   ├── deployment.md           # Deploy programs + backend
+│   └── security.md             # Trust model, key management
+├── .github/workflows/ci.yml   # CI pipeline
+├── CLAUDE.md
+└── LICENSE
 ```
+
+## Documentation
+
+- [Architecture](docs/architecture.md) — System design, randomness derivation, trust model, VRF comparison
+- [Integration Guide](docs/integration-guide.md) — TypeScript SDK + Rust CPI integration with full code examples
+- [Deployment](docs/deployment.md) — Program deploy, backend setup (Docker, systemd), env vars reference
+- [Security](docs/security.md) — Trust model, HMAC secret management, key rotation
 
 ## License
 

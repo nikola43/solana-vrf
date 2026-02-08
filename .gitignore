@@ -5,6 +5,7 @@ node_modules/
 target/
 program/target/
 backend/target/
+sdk/dist/
 
 # Anchor
 .anchor/

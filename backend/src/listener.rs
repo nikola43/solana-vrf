@@ -8,7 +8,7 @@
 //!
 //! 2. **Live stream** ([`listen_for_events`]) — subscribes to program log
 //!    events via WebSocket, parses `RandomnessRequested` Anchor events in
-//!    real-time, and auto-reconnects on disconnection.
+//!    real-time, and auto-reconnects with exponential backoff on disconnection.
 
 use base64::Engine;
 use solana_account_decoder::UiAccountEncoding;
@@ -20,11 +20,15 @@ use solana_client::rpc_config::{
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
+use crate::metrics::Metrics;
+use std::sync::Arc;
 
 /// Parsed representation of the on-chain `RandomnessRequested` Anchor event.
 #[derive(Debug, Clone)]
@@ -57,14 +61,35 @@ fn account_discriminator(account_name: &str) -> [u8; 8] {
     disc
 }
 
-/// Delay before reconnecting to the WebSocket after a disconnect or error.
-const WS_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Minimum WebSocket reconnect delay.
+const WS_RECONNECT_MIN: Duration = Duration::from_secs(1);
+/// Maximum WebSocket reconnect delay (capped exponential backoff).
+const WS_RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 /// Minimum expected account data length for a `RandomnessRequest`.
 ///
 /// Layout: discriminator (8) + request_id (8) + requester (32) + seed (32) +
 /// request_slot (8) + callback_program (32) + status (1) = 121 bytes.
 const MIN_ACCOUNT_DATA_LEN: usize = 121;
+
+/// Tracks request IDs that have already been dispatched to prevent duplicate
+/// fulfillment attempts when catch-up and WebSocket streams overlap.
+struct Deduplicator {
+    seen: Mutex<HashSet<u64>>,
+}
+
+impl Deduplicator {
+    fn new() -> Self {
+        Self {
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Returns `true` if this is the first time seeing this request ID.
+    fn insert(&self, request_id: u64) -> bool {
+        self.seen.lock().unwrap().insert(request_id)
+    }
+}
 
 /// Scan for any existing unfulfilled (Pending) requests on startup.
 ///
@@ -76,6 +101,7 @@ const MIN_ACCOUNT_DATA_LEN: usize = 121;
 pub async fn catch_up_pending_requests(
     config: &AppConfig,
     tx: &mpsc::Sender<RandomnessRequestedEvent>,
+    metrics: &Arc<Metrics>,
 ) {
     info!("Scanning for pending requests");
 
@@ -145,6 +171,8 @@ pub async fn catch_up_pending_requests(
                     "Queued pending request"
                 );
 
+                metrics.record_request();
+
                 let event = RandomnessRequestedEvent {
                     request_id,
                     requester,
@@ -164,9 +192,15 @@ pub async fn catch_up_pending_requests(
 }
 
 /// Subscribe to program logs via WebSocket and forward `RandomnessRequested`
-/// events to the fulfiller. Automatically reconnects on disconnection.
-pub async fn listen_for_events(config: AppConfig, tx: mpsc::Sender<RandomnessRequestedEvent>) {
+/// events to the fulfiller. Automatically reconnects with exponential backoff.
+pub async fn listen_for_events(
+    config: AppConfig,
+    tx: mpsc::Sender<RandomnessRequestedEvent>,
+    metrics: Arc<Metrics>,
+) {
     let discriminator = event_discriminator("RandomnessRequested");
+    let dedup = Deduplicator::new();
+    let mut reconnect_delay = WS_RECONNECT_MIN;
 
     loop {
         info!(url = %config.ws_url, "Connecting to WebSocket");
@@ -174,6 +208,8 @@ pub async fn listen_for_events(config: AppConfig, tx: mpsc::Sender<RandomnessReq
         match PubsubClient::new(&config.ws_url).await {
             Ok(pubsub) => {
                 info!("WebSocket connected");
+                // Reset backoff on successful connection
+                reconnect_delay = WS_RECONNECT_MIN;
 
                 let filter =
                     RpcTransactionLogsFilter::Mentions(vec![config.program_id.to_string()]);
@@ -189,6 +225,8 @@ pub async fn listen_for_events(config: AppConfig, tx: mpsc::Sender<RandomnessReq
                                 &log_result.value.logs,
                                 &discriminator,
                                 &tx,
+                                &dedup,
+                                &metrics,
                             )
                             .await;
                         }
@@ -204,8 +242,10 @@ pub async fn listen_for_events(config: AppConfig, tx: mpsc::Sender<RandomnessReq
             }
         }
 
-        info!(delay = ?WS_RECONNECT_DELAY, "Reconnecting");
-        tokio::time::sleep(WS_RECONNECT_DELAY).await;
+        info!(delay = ?reconnect_delay, "Reconnecting");
+        tokio::time::sleep(reconnect_delay).await;
+        // Exponential backoff capped at WS_RECONNECT_MAX
+        reconnect_delay = (reconnect_delay * 2).min(WS_RECONNECT_MAX);
     }
 }
 
@@ -219,6 +259,8 @@ async fn process_log_lines(
     logs: &[String],
     discriminator: &[u8; 8],
     tx: &mpsc::Sender<RandomnessRequestedEvent>,
+    dedup: &Deduplicator,
+    metrics: &Arc<Metrics>,
 ) {
     for log_line in logs {
         let Some(data_str) = log_line.strip_prefix("Program data: ") else {
@@ -241,6 +283,17 @@ async fn process_log_lines(
             warn!("Failed to parse RandomnessRequested event payload");
             continue;
         };
+
+        // Deduplicate: skip if we've already dispatched this request_id
+        if !dedup.insert(event.request_id) {
+            debug!(
+                request_id = event.request_id,
+                "Duplicate request, skipping"
+            );
+            continue;
+        }
+
+        metrics.record_request();
 
         info!(
             request_id = event.request_id,
