@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+target/
+program/target/
+backend/target/
+
+# Anchor
+.anchor/
+program/.anchor/
+test-ledger/
+
+# Solana
+*.so
+
+# Environment & secrets
+.env
+*.json
+!package.json
+!tsconfig.json
+!Cargo.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Rust
+**/*.rs.bk
+
+# Yarn
+.yarn/
