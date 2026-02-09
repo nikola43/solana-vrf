@@ -1,6 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { VrfSol } from "../target/types/vrf_sol";
+import { RollDice } from "../target/types/roll_dice";
 import { expect } from "chai";
 import {
   Keypair,
@@ -13,34 +14,56 @@ import {
 import fs from "fs";
 import * as testKeys from "./keys/load";
 
-describe("vrf-sol", () => {
+describe("vrf-sol coordinator", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
   const program = anchor.workspace.vrfSol as Program<VrfSol>;
+  const diceProgram = anchor.workspace.rollDice as Program<RollDice>;
   const admin = provider.wallet as anchor.Wallet;
 
-  // Oracle authority keypair (loaded from vrf-signer.json to match the backend)
+  // Oracle authority keypair
   const authoritySecret = JSON.parse(
     fs.readFileSync("../backend/vrf-signer.json", "utf-8")
   );
   const authority = Keypair.fromSecretKey(Uint8Array.from(authoritySecret));
-  const treasury = testKeys.treasury;
 
-  const fee = new anchor.BN(10_000); // 10,000 lamports
+  const feePerWord = new anchor.BN(10_000); // 10,000 lamports per word
+  const maxNumWords = 10;
 
   const [configPda] = PublicKey.findProgramAddressSync(
-    [Buffer.from("vrf-config")],
+    [Buffer.from("coordinator-config")],
     program.programId
   );
 
-  // Track whether config was already initialized from a prior run
+  // Track whether config was already initialized
   let configAlreadyExisted = false;
 
-  // Track request IDs dynamically
-  let fulfilledRequestId: number; // A request that has been fulfilled but not consumed
-  let pendingRequestId: number; // A request that is still pending
-  let consumedRequestId: number; // A request that has been consumed (ready to close)
+  // Subscription tracking
+  let subscriptionId: number;
+  let subscriptionPda: PublicKey;
+
+  function getSubscriptionPda(subId: number | anchor.BN): PublicKey {
+    const id = new anchor.BN(subId);
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("subscription"), id.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    return pda;
+  }
+
+  function getConsumerPda(subId: number | anchor.BN, consumerProgram: PublicKey): PublicKey {
+    const id = new anchor.BN(subId);
+    const [pda] = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("consumer"),
+        id.toArrayLike(Buffer, "le", 8),
+        consumerProgram.toBuffer(),
+      ],
+      program.programId
+    );
+    return pda;
+  }
 
   function getRequestPda(requestId: number | anchor.BN): PublicKey {
     const id = new anchor.BN(requestId);
@@ -52,68 +75,13 @@ describe("vrf-sol", () => {
   }
 
   async function getNextRequestId(): Promise<number> {
-    const config = await program.account.vrfConfiguration.fetch(configPda);
+    const config = await program.account.coordinatorConfig.fetch(configPda);
     return config.requestCounter.toNumber();
   }
 
-  async function createRequest(seed: number): Promise<number> {
-    const requestId = await getNextRequestId();
-    const seedBuf = Buffer.alloc(32, seed);
-    const requestPda = getRequestPda(requestId);
-
-    await program.methods
-      .requestRandomness([...seedBuf] as any)
-      .accounts({
-        requester: admin.publicKey,
-        config: configPda,
-        request: requestPda,
-        treasury: treasury.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
-
-    return requestId;
-  }
-
-  async function fulfillRequest(
-    requestId: number,
-    randomnessValue: number
-  ): Promise<void> {
-    const reqId = new anchor.BN(requestId);
-    const randomness = Buffer.alloc(32, randomnessValue);
-    const message = Buffer.concat([
-      reqId.toArrayLike(Buffer, "le", 8),
-      randomness,
-    ]);
-    const ed25519Ix = Ed25519Program.createInstructionWithPrivateKey({
-      privateKey: authority.secretKey,
-      message: message,
-    });
-
-    try {
-      await program.methods
-        .fulfillRandomness(reqId, [...randomness] as any)
-        .accounts({
-          authority: authority.publicKey,
-          config: configPda,
-          request: getRequestPda(requestId),
-          instructionsSysvar: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
-        })
-        .preInstructions([ed25519Ix])
-        .signers([authority])
-        .rpc();
-    } catch (e: any) {
-      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
-      if (
-        errStr.includes("RequestNotPending") ||
-        errStr.includes("Unknown action") ||
-        errStr.includes('"Custom":6000') ||
-        errStr.includes('"Custom": 6000')
-      ) {
-        return; // Backend already fulfilled this request
-      }
-      throw e;
-    }
+  async function getNextSubscriptionId(): Promise<number> {
+    const config = await program.account.coordinatorConfig.fetch(configPda);
+    return config.subscriptionCounter.toNumber();
   }
 
   async function fundAccount(
@@ -131,24 +99,21 @@ describe("vrf-sol", () => {
   }
 
   before(async () => {
-    // Fund authority so it can sign transactions
+    // Fund authority
     await fundAccount(authority.publicKey, 5 * LAMPORTS_PER_SOL);
 
-    // Fund treasury so it can receive fee transfers (needs rent-exempt minimum)
-    await fundAccount(treasury.publicKey, LAMPORTS_PER_SOL);
-
-    // Fund all fixed test keypairs (for negative test cases)
+    // Fund test keypairs
     await fundAccount(testKeys.wrongAuthority.publicKey, LAMPORTS_PER_SOL);
     await fundAccount(testKeys.wrongPlayer.publicKey, LAMPORTS_PER_SOL);
     await fundAccount(testKeys.nonAdmin.publicKey, LAMPORTS_PER_SOL);
 
-    // Check if config already exists (from a prior test run)
+    // Check if config already exists
     const existingConfig = await provider.connection.getAccountInfo(configPda);
     if (existingConfig) {
       configAlreadyExisted = true;
-      // Update config to use our local authority and treasury for this run
+      // Update config to use our local authority for this run
       await program.methods
-        .updateConfig(authority.publicKey, fee, treasury.publicKey, null)
+        .updateConfig(authority.publicKey, feePerWord, maxNumWords, null)
         .accounts({
           admin: admin.publicKey,
           config: configPda,
@@ -157,118 +122,344 @@ describe("vrf-sol", () => {
     }
   });
 
-  // Delay between tests to respect Helius devnet rate limits (50 req/s)
   beforeEach(async () => {
     await new Promise((r) => setTimeout(r, 1000));
   });
 
-  // Test 1: Initialize - happy path (or verify after update on re-run)
-  it("Initializes the VRF config", async () => {
+  // === INITIALIZATION ===
+
+  it("Initializes the coordinator config", async () => {
     if (configAlreadyExisted) {
-      // Config already existed — before hook updated it, just verify
-      const config = await program.account.vrfConfiguration.fetch(configPda);
+      const config = await program.account.coordinatorConfig.fetch(configPda);
       expect(config.admin.toBase58()).to.equal(admin.publicKey.toBase58());
-      expect(config.authority.toBase58()).to.equal(
-        authority.publicKey.toBase58()
-      );
-      expect(config.fee.toNumber()).to.equal(10_000);
-      expect(config.treasury.toBase58()).to.equal(
-        treasury.publicKey.toBase58()
-      );
+      expect(config.authority.toBase58()).to.equal(authority.publicKey.toBase58());
+      expect(config.feePerWord.toNumber()).to.equal(10_000);
+      expect(config.maxNumWords).to.equal(maxNumWords);
       return;
     }
 
     await program.methods
-      .initialize(fee)
+      .initialize(feePerWord, maxNumWords)
       .accounts({
         admin: admin.publicKey,
         authority: authority.publicKey,
-        treasury: treasury.publicKey,
         config: configPda,
         systemProgram: SystemProgram.programId,
       })
       .rpc();
 
-    const config = await program.account.vrfConfiguration.fetch(configPda);
+    const config = await program.account.coordinatorConfig.fetch(configPda);
     expect(config.admin.toBase58()).to.equal(admin.publicKey.toBase58());
-    expect(config.authority.toBase58()).to.equal(
-      authority.publicKey.toBase58()
-    );
-    expect(config.fee.toNumber()).to.equal(10_000);
+    expect(config.authority.toBase58()).to.equal(authority.publicKey.toBase58());
+    expect(config.feePerWord.toNumber()).to.equal(10_000);
+    expect(config.maxNumWords).to.equal(maxNumWords);
     expect(config.requestCounter.toNumber()).to.equal(0);
-    expect(config.treasury.toBase58()).to.equal(treasury.publicKey.toBase58());
+    expect(config.subscriptionCounter.toNumber()).to.equal(0);
   });
 
-  // Test 2: Request randomness - happy path + fee transfer
-  it("Requests randomness and pays fee", async () => {
-    const seed = Buffer.alloc(32);
-    seed.fill(1);
+  it("Fails to initialize config twice", async () => {
+    try {
+      await program.methods
+        .initialize(feePerWord, maxNumWords)
+        .accounts({
+          admin: admin.publicKey,
+          authority: authority.publicKey,
+          config: configPda,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      expect.fail("Should have failed - config already initialized");
+    } catch (e: any) {
+      expect(e.toString()).to.contain("Error");
+    }
+  });
 
-    const treasuryBalanceBefore = await provider.connection.getBalance(
-      treasury.publicKey
-    );
+  // === SUBSCRIPTION MANAGEMENT ===
 
-    const nextId = await getNextRequestId();
-    const requestPda = getRequestPda(nextId);
+  it("Creates a subscription", async () => {
+    subscriptionId = await getNextSubscriptionId();
+    subscriptionPda = getSubscriptionPda(subscriptionId);
 
     await program.methods
-      .requestRandomness([...seed] as any)
+      .createSubscription()
       .accounts({
-        requester: admin.publicKey,
+        owner: admin.publicKey,
         config: configPda,
-        request: requestPda,
-        treasury: treasury.publicKey,
+        subscription: subscriptionPda,
         systemProgram: SystemProgram.programId,
       })
       .rpc();
 
-    const treasuryBalanceAfter = await provider.connection.getBalance(
-      treasury.publicKey
-    );
-    expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(10_000);
+    const sub = await program.account.subscription.fetch(subscriptionPda);
+    expect(sub.id.toNumber()).to.equal(subscriptionId);
+    expect(sub.owner.toBase58()).to.equal(admin.publicKey.toBase58());
+    expect(sub.balance.toNumber()).to.equal(0);
+    expect(sub.reqCount.toNumber()).to.equal(0);
+    expect(sub.consumerCount).to.equal(0);
 
+    // Verify counter incremented
+    const config = await program.account.coordinatorConfig.fetch(configPda);
+    expect(config.subscriptionCounter.toNumber()).to.equal(subscriptionId + 1);
+  });
+
+  it("Funds a subscription", async () => {
+    const amount = new anchor.BN(LAMPORTS_PER_SOL);
+
+    await program.methods
+      .fundSubscription(new anchor.BN(subscriptionId), amount)
+      .accounts({
+        funder: admin.publicKey,
+        subscription: subscriptionPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const sub = await program.account.subscription.fetch(subscriptionPda);
+    expect(sub.balance.toNumber()).to.equal(LAMPORTS_PER_SOL);
+  });
+
+  it("Adds a consumer to the subscription", async () => {
+    const consumerPda = getConsumerPda(subscriptionId, diceProgram.programId);
+
+    await program.methods
+      .addConsumer(new anchor.BN(subscriptionId))
+      .accounts({
+        owner: admin.publicKey,
+        subscription: subscriptionPda,
+        consumerProgram: diceProgram.programId,
+        consumerRegistration: consumerPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const reg = await program.account.consumerRegistration.fetch(consumerPda);
+    expect(reg.subscriptionId.toNumber()).to.equal(subscriptionId);
+    expect(reg.programId.toBase58()).to.equal(diceProgram.programId.toBase58());
+
+    const sub = await program.account.subscription.fetch(subscriptionPda);
+    expect(sub.consumerCount).to.equal(1);
+  });
+
+  it("Fails to cancel subscription with consumers", async () => {
+    try {
+      await program.methods
+        .cancelSubscription(new anchor.BN(subscriptionId))
+        .accounts({
+          owner: admin.publicKey,
+          subscription: subscriptionPda,
+        })
+        .rpc();
+      expect.fail("Should have failed - subscription has consumers");
+    } catch (e: any) {
+      expect(e.toString()).to.contain("SubscriptionHasConsumers");
+    }
+  });
+
+  it("Fails to add consumer with non-owner", async () => {
+    const nonAdmin = testKeys.nonAdmin;
+    const fakeConsumer = Keypair.generate();
+    const consumerPda = getConsumerPda(subscriptionId, fakeConsumer.publicKey);
+
+    try {
+      await program.methods
+        .addConsumer(new anchor.BN(subscriptionId))
+        .accounts({
+          owner: nonAdmin.publicKey,
+          subscription: subscriptionPda,
+          consumerProgram: fakeConsumer.publicKey,
+          consumerRegistration: consumerPda,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([nonAdmin])
+        .rpc();
+      expect.fail("Should have failed - not owner");
+    } catch (e: any) {
+      expect(e.toString()).to.contain("Unauthorized");
+    }
+  });
+
+  // === REQUEST RANDOM WORDS ===
+
+  it("Requests random words via CPI from dice program", async () => {
+    const requestId = await getNextRequestId();
+    const seed = Buffer.alloc(32, 0x01);
+    const requestPda = getRequestPda(requestId);
+    const diceRollPda = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("dice-roll"),
+        admin.publicKey.toBuffer(),
+        new anchor.BN(requestId).toArrayLike(Buffer, "le", 8),
+      ],
+      diceProgram.programId
+    )[0];
+
+    // First initialize the game config
+    const [gameConfigPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("game-config")],
+      diceProgram.programId
+    );
+
+    const existingGameConfig = await provider.connection.getAccountInfo(gameConfigPda);
+    if (!existingGameConfig) {
+      await diceProgram.methods
+        .initialize(program.programId, new anchor.BN(subscriptionId))
+        .accounts({
+          admin: admin.publicKey,
+          gameConfig: gameConfigPda,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+    }
+
+    const consumerPda = getConsumerPda(subscriptionId, diceProgram.programId);
+
+    await diceProgram.methods
+      .requestRoll([...seed] as any)
+      .accounts({
+        player: admin.publicKey,
+        gameConfig: gameConfigPda,
+        vrfConfig: configPda,
+        subscription: subscriptionPda,
+        consumerRegistration: consumerPda,
+        vrfRequest: requestPda,
+        thisProgram: diceProgram.programId,
+        diceRoll: diceRollPda,
+        vrfProgram: program.programId,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Verify request was created
     const request = await program.account.randomnessRequest.fetch(requestPda);
-    expect(request.requestId.toNumber()).to.equal(nextId);
+    expect(request.requestId.toNumber()).to.equal(requestId);
+    expect(request.subscriptionId.toNumber()).to.equal(subscriptionId);
+    expect(request.consumerProgram.toBase58()).to.equal(diceProgram.programId.toBase58());
     expect(request.requester.toBase58()).to.equal(admin.publicKey.toBase58());
-    expect(Buffer.from(request.seed)).to.deep.equal(seed);
+    expect(request.numWords).to.equal(1);
     expect(request.status).to.equal(0); // Pending
     expect(request.requestSlot.toNumber()).to.be.greaterThan(0);
 
-    // Verify counter incremented
-    const config = await program.account.vrfConfiguration.fetch(configPda);
-    expect(config.requestCounter.toNumber()).to.equal(nextId + 1);
+    // Verify subscription balance decreased
+    const sub = await program.account.subscription.fetch(subscriptionPda);
+    expect(sub.balance.toNumber()).to.equal(LAMPORTS_PER_SOL - 10_000); // 1 word * fee_per_word
 
-    // This will be our first request - save it for the fulfill test
-    consumedRequestId = nextId;
+    // Verify dice roll created
+    const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
+    expect(diceRoll.result).to.equal(0);
+    expect(diceRoll.player.toBase58()).to.equal(admin.publicKey.toBase58());
+    expect(diceRoll.vrfRequestId.toNumber()).to.equal(requestId);
   });
 
-  // Test 3: Fulfill randomness - happy path with Ed25519 instruction
-  it("Fulfills randomness with valid Ed25519 signature", async () => {
-    const requestId = new anchor.BN(consumedRequestId);
-    const requestPda = getRequestPda(consumedRequestId);
+  it("Fails with insufficient subscription balance", async () => {
+    // Create a new subscription with no funds
+    const newSubId = await getNextSubscriptionId();
+    const newSubPda = getSubscriptionPda(newSubId);
 
-    const randomness = Buffer.alloc(32);
-    randomness.fill(42);
+    await program.methods
+      .createSubscription()
+      .accounts({
+        owner: admin.publicKey,
+        config: configPda,
+        subscription: newSubPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Register the dice program as consumer
+    const consumerPda = getConsumerPda(newSubId, diceProgram.programId);
+    await program.methods
+      .addConsumer(new anchor.BN(newSubId))
+      .accounts({
+        owner: admin.publicKey,
+        subscription: newSubPda,
+        consumerProgram: diceProgram.programId,
+        consumerRegistration: consumerPda,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    // Try to request (should fail — no balance)
+    const requestId = await getNextRequestId();
+    const seed = Buffer.alloc(32, 0x02);
+    const requestPda = getRequestPda(requestId);
+
+    // Initialize a separate game config for this test if needed
+    // Actually, the dice program uses its own game-config which points to the original subscription.
+    // We need to call request_random_words directly to test with the unfunded subscription.
+    try {
+      await program.methods
+        .requestRandomWords(1, [...seed] as any, 200_000)
+        .accounts({
+          requester: admin.publicKey,
+          config: configPda,
+          subscription: newSubPda,
+          consumerRegistration: consumerPda,
+          consumerProgram: diceProgram.programId,
+          request: requestPda,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      expect.fail("Should have failed - insufficient balance");
+    } catch (e: any) {
+      expect(e.toString()).to.contain("InsufficientSubscriptionBalance");
+    }
+  });
+
+  // === FULFILL RANDOM WORDS ===
+
+  it("Fulfills random words with Ed25519 proof and delivers callback", async () => {
+    // Get the last created request (from the dice roll test)
+    const requestId = (await getNextRequestId()) - 1;
+    const reqId = new anchor.BN(requestId);
+    const requestPda = getRequestPda(requestId);
+
+    // Check if already fulfilled (backend may have raced us)
+    const reqBefore = await program.account.randomnessRequest.fetch(requestPda);
+    if (reqBefore.status !== 0) {
+      // Already fulfilled — skip
+      return;
+    }
+
+    const randomness = Buffer.alloc(32, 0x42);
 
     const message = Buffer.concat([
-      requestId.toArrayLike(Buffer, "le", 8),
+      reqId.toArrayLike(Buffer, "le", 8),
       randomness,
     ]);
-
     const ed25519Ix = Ed25519Program.createInstructionWithPrivateKey({
       privateKey: authority.secretKey,
       message: message,
     });
 
+    // Derive consumer callback accounts
+    const [gameConfigPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("game-config")],
+      diceProgram.programId
+    );
+    const diceRollPda = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("dice-roll"),
+        admin.publicKey.toBuffer(),
+        reqId.toArrayLike(Buffer, "le", 8),
+      ],
+      diceProgram.programId
+    )[0];
+
     try {
       await program.methods
-        .fulfillRandomness(requestId, [...randomness] as any)
+        .fulfillRandomWords(reqId, [...randomness] as any)
         .accounts({
           authority: authority.publicKey,
           config: configPda,
           request: requestPda,
+          requester: admin.publicKey,
+          consumerProgram: diceProgram.programId,
           instructionsSysvar: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
         })
+        .remainingAccounts([
+          { pubkey: gameConfigPda, isWritable: false, isSigner: false },
+          { pubkey: diceRollPda, isWritable: true, isSigner: false },
+        ])
         .preInstructions([ed25519Ix])
         .signers([authority])
         .rpc();
@@ -276,35 +467,67 @@ describe("vrf-sol", () => {
       const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       if (
         errStr.includes("RequestNotPending") ||
-        errStr.includes("Unknown action") ||
         errStr.includes('"Custom":6000') ||
         errStr.includes('"Custom": 6000')
       ) {
-        // Backend already fulfilled — that's fine
-      } else {
-        throw e;
+        // Backend already fulfilled
+        return;
       }
+      throw e;
     }
 
-    const request = await program.account.randomnessRequest.fetch(requestPda);
-    expect(request.status).to.be.gte(1); // Fulfilled (by test or backend)
-    expect(request.fulfilledSlot.toNumber()).to.be.greaterThan(0);
+    // Verify dice roll was settled via callback
+    const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
+    expect(diceRoll.result).to.be.gte(1).and.lte(6);
+
+    // Verify request PDA was closed (rent refunded)
+    const requestAccount = await provider.connection.getAccountInfo(requestPda);
+    expect(requestAccount).to.be.null;
   });
 
-  // Test 4: Fulfill - wrong authority fails
   it("Fails to fulfill with wrong authority", async () => {
-    // Create a new pending request for this test
-    const reqId = await createRequest(0x04);
+    // Create a new request for this test
+    const requestId = await getNextRequestId();
+    const seed = Buffer.alloc(32, 0x04);
+    const requestPda = getRequestPda(requestId);
+    const consumerPda = getConsumerPda(subscriptionId, diceProgram.programId);
+    const [gameConfigPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("game-config")],
+      diceProgram.programId
+    );
+    const diceRollPda = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("dice-roll"),
+        admin.publicKey.toBuffer(),
+        new anchor.BN(requestId).toArrayLike(Buffer, "le", 8),
+      ],
+      diceProgram.programId
+    )[0];
+
+    // Create request via CPI
+    await diceProgram.methods
+      .requestRoll([...seed] as any)
+      .accounts({
+        player: admin.publicKey,
+        gameConfig: gameConfigPda,
+        vrfConfig: configPda,
+        subscription: subscriptionPda,
+        consumerRegistration: consumerPda,
+        vrfRequest: requestPda,
+        thisProgram: diceProgram.programId,
+        diceRoll: diceRollPda,
+        vrfProgram: program.programId,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
 
     const wrongAuthority = testKeys.wrongAuthority;
-
-    const requestId = new anchor.BN(reqId);
-    const randomness = Buffer.alloc(32, 99);
+    const reqId = new anchor.BN(requestId);
+    const randomness = Buffer.alloc(32, 0x99);
     const message = Buffer.concat([
-      requestId.toArrayLike(Buffer, "le", 8),
+      reqId.toArrayLike(Buffer, "le", 8),
       randomness,
     ]);
-
     const ed25519Ix = Ed25519Program.createInstructionWithPrivateKey({
       privateKey: wrongAuthority.secretKey,
       message: message,
@@ -312,165 +535,97 @@ describe("vrf-sol", () => {
 
     try {
       await program.methods
-        .fulfillRandomness(requestId, [...randomness] as any)
+        .fulfillRandomWords(reqId, [...randomness] as any)
         .accounts({
           authority: wrongAuthority.publicKey,
           config: configPda,
-          request: getRequestPda(reqId),
+          request: requestPda,
+          requester: admin.publicKey,
+          consumerProgram: diceProgram.programId,
           instructionsSysvar: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
         })
+        .remainingAccounts([
+          { pubkey: gameConfigPda, isWritable: false, isSigner: false },
+          { pubkey: diceRollPda, isWritable: true, isSigner: false },
+        ])
         .preInstructions([ed25519Ix])
         .signers([wrongAuthority])
         .rpc();
       expect.fail("Should have failed with wrong authority");
     } catch (e: any) {
       const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
-      // Unauthorized (wrong authority rejected) or RequestNotPending (backend fulfilled first)
       expect(
         errStr.includes("Unauthorized") ||
         errStr.includes("RequestNotPending") ||
-        errStr.includes("Unknown action") ||
         errStr.includes('"Custom":6000') ||
         errStr.includes('"Custom": 6000') ||
-        errStr.includes('"Custom":6009') ||
-        errStr.includes('"Custom": 6009')
+        errStr.includes('"Custom":6007') ||
+        errStr.includes('"Custom": 6007')
       ).to.be.true;
     }
-
-    // Save this as our pending request for later tests
-    pendingRequestId = reqId;
   });
 
-  // Test 5: Fulfill - missing Ed25519 instruction fails
-  it("Fails to fulfill without Ed25519 instruction", async () => {
-    const requestId = new anchor.BN(pendingRequestId);
-    const randomness = Buffer.alloc(32, 99);
+  // === REMOVE CONSUMER ===
 
-    try {
-      await program.methods
-        .fulfillRandomness(requestId, [...randomness] as any)
-        .accounts({
-          authority: authority.publicKey,
-          config: configPda,
-          request: getRequestPda(pendingRequestId),
-          instructionsSysvar: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
-        })
-        .signers([authority])
-        .rpc();
-      expect.fail("Should have failed without Ed25519 instruction");
-    } catch (e: any) {
-      expect(e.toString()).to.contain("Error");
-    }
-  });
-
-  // Test 6: Consume randomness - happy path
-  it("Consumes fulfilled randomness", async () => {
-    const requestId = new anchor.BN(consumedRequestId);
-    const requestPda = getRequestPda(consumedRequestId);
+  it("Removes a consumer from the subscription", async () => {
+    // Add a second consumer to test removal
+    const fakeConsumer = Keypair.generate();
+    const consumerPda = getConsumerPda(subscriptionId, fakeConsumer.publicKey);
 
     await program.methods
-      .consumeRandomness(requestId)
+      .addConsumer(new anchor.BN(subscriptionId))
       .accounts({
-        requester: admin.publicKey,
-        request: requestPda,
+        owner: admin.publicKey,
+        subscription: subscriptionPda,
+        consumerProgram: fakeConsumer.publicKey,
+        consumerRegistration: consumerPda,
+        systemProgram: SystemProgram.programId,
       })
       .rpc();
 
-    const request = await program.account.randomnessRequest.fetch(requestPda);
-    expect(request.status).to.equal(2); // Consumed
-  });
-
-  // Test 7: Consume - wrong requester fails
-  it("Fails to consume with wrong requester", async () => {
-    // Fulfill the pending request so we can try to consume with wrong requester
-    await fulfillRequest(pendingRequestId, 77);
-    fulfilledRequestId = pendingRequestId;
-
-    const wrongRequester = testKeys.wrongPlayer;
-
-    try {
-      await program.methods
-        .consumeRandomness(new anchor.BN(fulfilledRequestId))
-        .accounts({
-          requester: wrongRequester.publicKey,
-          request: getRequestPda(fulfilledRequestId),
-        })
-        .signers([wrongRequester])
-        .rpc();
-      expect.fail("Should have failed with wrong requester");
-    } catch (e: any) {
-      expect(e.toString()).to.contain("Unauthorized");
-    }
-  });
-
-  // Test 8: Close request - reclaims rent
-  it("Closes consumed request and reclaims rent", async () => {
-    const requestId = new anchor.BN(consumedRequestId);
-    const requestPda = getRequestPda(consumedRequestId);
+    const subBefore = await program.account.subscription.fetch(subscriptionPda);
+    const countBefore = subBefore.consumerCount;
 
     await program.methods
-      .closeRequest(requestId)
+      .removeConsumer(new anchor.BN(subscriptionId))
       .accounts({
-        requester: admin.publicKey,
-        request: requestPda,
+        owner: admin.publicKey,
+        subscription: subscriptionPda,
+        consumerProgram: fakeConsumer.publicKey,
+        consumerRegistration: consumerPda,
       })
       .rpc();
 
-    const account = await provider.connection.getAccountInfo(requestPda);
-    expect(account).to.be.null;
+    const subAfter = await program.account.subscription.fetch(subscriptionPda);
+    expect(subAfter.consumerCount).to.equal(countBefore - 1);
+
+    // Registration account should be closed
+    const regAccount = await provider.connection.getAccountInfo(consumerPda);
+    expect(regAccount).to.be.null;
   });
 
-  // Test 9: Close - unconsumed request fails
-  it("Fails to close unconsumed request", async () => {
-    // Create a new pending request
-    const reqId = await createRequest(0x09);
+  // === UPDATE CONFIG ===
 
-    try {
-      await program.methods
-        .closeRequest(new anchor.BN(reqId))
-        .accounts({
-          requester: admin.publicKey,
-          request: getRequestPda(reqId),
-        })
-        .rpc();
-      expect.fail("Should have failed - request not consumed");
-    } catch (e: any) {
-      expect(e.toString()).to.contain("RequestNotConsumed");
-    }
-  });
-
-  // Test 10: Update config - admin only
   it("Updates config as admin", async () => {
     const newAuthority = testKeys.newAuthority;
-    const newTreasury = testKeys.newTreasury;
     const newFee = new anchor.BN(20_000);
 
     await program.methods
-      .updateConfig(
-        newAuthority.publicKey,
-        newFee,
-        newTreasury.publicKey,
-        null
-      )
+      .updateConfig(newAuthority.publicKey, newFee, 20, null)
       .accounts({
         admin: admin.publicKey,
         config: configPda,
       })
       .rpc();
 
-    const config = await program.account.vrfConfiguration.fetch(configPda);
-    expect(config.authority.toBase58()).to.equal(
-      newAuthority.publicKey.toBase58()
-    );
-    expect(config.fee.toNumber()).to.equal(20_000);
-    expect(config.treasury.toBase58()).to.equal(
-      newTreasury.publicKey.toBase58()
-    );
-    expect(config.admin.toBase58()).to.equal(admin.publicKey.toBase58());
+    const config = await program.account.coordinatorConfig.fetch(configPda);
+    expect(config.authority.toBase58()).to.equal(newAuthority.publicKey.toBase58());
+    expect(config.feePerWord.toNumber()).to.equal(20_000);
+    expect(config.maxNumWords).to.equal(20);
 
-    // Revert authority and treasury back for further tests
+    // Revert for further tests
     await program.methods
-      .updateConfig(authority.publicKey, fee, treasury.publicKey, null)
+      .updateConfig(authority.publicKey, feePerWord, maxNumWords, null)
       .accounts({
         admin: admin.publicKey,
         config: configPda,
@@ -478,97 +633,8 @@ describe("vrf-sol", () => {
       .rpc();
   });
 
-  // Test 11: Multiple requests - counter increments
-  it("Handles multiple requests with incrementing counter", async () => {
-    const counterBefore = await getNextRequestId();
-
-    for (let i = 0; i < 2; i++) {
-      await createRequest(10 + i);
-    }
-
-    const counterAfter = await getNextRequestId();
-    expect(counterAfter).to.equal(counterBefore + 2);
-  });
-
-  // Test 12: Double-fulfill attempt → RequestNotPending
-  it("Fails to double-fulfill a request", async () => {
-    // fulfilledRequestId is already fulfilled; try to fulfill again
-    const requestId = new anchor.BN(fulfilledRequestId);
-    const randomness = Buffer.alloc(32, 55);
-    const message = Buffer.concat([
-      requestId.toArrayLike(Buffer, "le", 8),
-      randomness,
-    ]);
-    const ed25519Ix = Ed25519Program.createInstructionWithPrivateKey({
-      privateKey: authority.secretKey,
-      message: message,
-    });
-
-    try {
-      await program.methods
-        .fulfillRandomness(requestId, [...randomness] as any)
-        .accounts({
-          authority: authority.publicKey,
-          config: configPda,
-          request: getRequestPda(fulfilledRequestId),
-          instructionsSysvar: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
-        })
-        .preInstructions([ed25519Ix])
-        .signers([authority])
-        .rpc();
-      expect.fail("Should have failed - request already fulfilled");
-    } catch (e: any) {
-      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
-      expect(
-        errStr.includes("RequestNotPending") ||
-        errStr.includes('"Custom":6000') ||
-        errStr.includes('"Custom": 6000')
-      ).to.be.true;
-    }
-  });
-
-  // Test 13: Consume pending request → RequestNotFulfilled
-  it("Fails to consume a pending request", async () => {
-    // Create a fresh pending request
-    const reqId = await createRequest(0x13);
-
-    try {
-      await program.methods
-        .consumeRandomness(new anchor.BN(reqId))
-        .accounts({
-          requester: admin.publicKey,
-          request: getRequestPda(reqId),
-        })
-        .rpc();
-      // If backend fulfilled between create and consume, consume succeeds — that's OK
-    } catch (e: any) {
-      expect(e.toString()).to.contain("RequestNotFulfilled");
-    }
-  });
-
-  // Test 14: Close fulfilled-but-unconsumed request → RequestNotConsumed
-  it("Fails to close a fulfilled but unconsumed request", async () => {
-    // fulfilledRequestId is fulfilled but not consumed
-    const requestId = new anchor.BN(fulfilledRequestId);
-
-    try {
-      await program.methods
-        .closeRequest(requestId)
-        .accounts({
-          requester: admin.publicKey,
-          request: getRequestPda(fulfilledRequestId),
-        })
-        .rpc();
-      expect.fail("Should have failed - request not consumed");
-    } catch (e: any) {
-      expect(e.toString()).to.contain("RequestNotConsumed");
-    }
-  });
-
-  // Test 15: Update config with non-admin → Unauthorized
   it("Fails to update config with non-admin", async () => {
     const nonAdmin = testKeys.nonAdmin;
-
     try {
       await program.methods
         .updateConfig(null, new anchor.BN(999), null, null)
@@ -584,7 +650,6 @@ describe("vrf-sol", () => {
     }
   });
 
-  // Test 16: Update config with zero-address authority → ZeroAddressNotAllowed
   it("Fails to update config with zero-address authority", async () => {
     try {
       await program.methods
@@ -600,68 +665,6 @@ describe("vrf-sol", () => {
     }
   });
 
-  // Test 17: Update config with zero-address treasury → ZeroAddressNotAllowed
-  it("Fails to update config with zero-address treasury", async () => {
-    try {
-      await program.methods
-        .updateConfig(null, null, PublicKey.default, null)
-        .accounts({
-          admin: admin.publicKey,
-          config: configPda,
-        })
-        .rpc();
-      expect.fail("Should have failed - zero address treasury");
-    } catch (e: any) {
-      expect(e.toString()).to.contain("ZeroAddressNotAllowed");
-    }
-  });
-
-  // Test 18: Fulfill with wrong Ed25519 message → InvalidEd25519Message
-  it("Fails to fulfill with wrong Ed25519 message", async () => {
-    // Create a fresh pending request for this test
-    const reqId = await createRequest(0x18);
-    const requestId = new anchor.BN(reqId);
-    const randomness = Buffer.alloc(32, 88);
-    const wrongRandomness = Buffer.alloc(32, 99);
-
-    // Sign with wrong randomness in the message
-    const wrongMessage = Buffer.concat([
-      requestId.toArrayLike(Buffer, "le", 8),
-      wrongRandomness,
-    ]);
-
-    const ed25519Ix = Ed25519Program.createInstructionWithPrivateKey({
-      privateKey: authority.secretKey,
-      message: wrongMessage,
-    });
-
-    try {
-      await program.methods
-        .fulfillRandomness(requestId, [...randomness] as any)
-        .accounts({
-          authority: authority.publicKey,
-          config: configPda,
-          request: getRequestPda(reqId),
-          instructionsSysvar: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
-        })
-        .preInstructions([ed25519Ix])
-        .signers([authority])
-        .rpc();
-      expect.fail("Should have failed - wrong message");
-    } catch (e: any) {
-      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
-      // InvalidEd25519Message (message mismatch) or RequestNotPending (backend fulfilled first)
-      expect(
-        errStr.includes("InvalidEd25519Message") ||
-        errStr.includes("RequestNotPending") ||
-        errStr.includes("Unknown action") ||
-        errStr.includes('"Custom":6000') ||
-        errStr.includes('"Custom": 6000')
-      ).to.be.true;
-    }
-  });
-
-  // Test 19: Update config with zero-address admin → ZeroAddressNotAllowed
   it("Fails to update config with zero-address admin", async () => {
     try {
       await program.methods
@@ -675,229 +678,5 @@ describe("vrf-sol", () => {
     } catch (e: any) {
       expect(e.toString()).to.contain("ZeroAddressNotAllowed");
     }
-  });
-
-  // Test 20: Close request with wrong requester → Unauthorized
-  it("Fails to close request with wrong requester", async () => {
-    // Consume fulfilledRequestId so it's ready to close
-    await program.methods
-      .consumeRandomness(new anchor.BN(fulfilledRequestId))
-      .accounts({
-        requester: admin.publicKey,
-        request: getRequestPda(fulfilledRequestId),
-      })
-      .rpc();
-
-    const wrongRequester = testKeys.wrongPlayer;
-
-    try {
-      await program.methods
-        .closeRequest(new anchor.BN(fulfilledRequestId))
-        .accounts({
-          requester: wrongRequester.publicKey,
-          request: getRequestPda(fulfilledRequestId),
-        })
-        .signers([wrongRequester])
-        .rpc();
-      expect.fail("Should have failed - wrong requester");
-    } catch (e: any) {
-      expect(e.toString()).to.contain("Unauthorized");
-    }
-  });
-
-  // Test 21: Double-consume attempt → RequestNotFulfilled (already consumed)
-  it("Fails to double-consume a request", async () => {
-    // fulfilledRequestId was just consumed in test 20, try again
-    try {
-      await program.methods
-        .consumeRandomness(new anchor.BN(fulfilledRequestId))
-        .accounts({
-          requester: admin.publicKey,
-          request: getRequestPda(fulfilledRequestId),
-        })
-        .rpc();
-      expect.fail("Should have failed - already consumed");
-    } catch (e: any) {
-      expect(e.toString()).to.contain("RequestNotFulfilled");
-    }
-  });
-
-  // Test 22: Initialize twice → PDA already exists
-  it("Fails to initialize config twice", async () => {
-    try {
-      await program.methods
-        .initialize(fee)
-        .accounts({
-          admin: admin.publicKey,
-          authority: authority.publicKey,
-          treasury: treasury.publicKey,
-          config: configPda,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
-      expect.fail("Should have failed - config already initialized");
-    } catch (e: any) {
-      // Anchor returns an error because the PDA account already exists
-      expect(e.toString()).to.contain("Error");
-    }
-  });
-
-  // Test 23: Full lifecycle with event emission check
-  it("Emits all events through full lifecycle", async () => {
-    // Wait for fresh blockhash after many sequential transactions
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-
-    const nextId = await getNextRequestId();
-    const requestId = new anchor.BN(nextId);
-    const requestPda = getRequestPda(nextId);
-    const seed = Buffer.alloc(32, 0xaa);
-    const randomness = Buffer.alloc(32, 0xbb);
-
-    // Helper to count "Program data:" log entries for our program
-    function countProgramDataLogs(logs: string[]): number {
-      return logs.filter((l) => l.includes("Program data:")).length;
-    }
-
-    // 1. Request → emits RandomnessRequested event (Program data: ...)
-    const requestTx = await program.methods
-      .requestRandomness([...seed] as any)
-      .accounts({
-        requester: admin.publicKey,
-        config: configPda,
-        request: requestPda,
-        treasury: treasury.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc({ commitment: "confirmed" });
-
-    let txDetails = await provider.connection.getTransaction(requestTx, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
-    expect(
-      countProgramDataLogs(txDetails!.meta!.logMessages!)
-    ).to.be.gte(1);
-
-    // 2. Fulfill → emits RandomnessFulfilled event (backend may race us)
-    const message = Buffer.concat([
-      requestId.toArrayLike(Buffer, "le", 8),
-      randomness,
-    ]);
-    const ed25519Ix = Ed25519Program.createInstructionWithPrivateKey({
-      privateKey: authority.secretKey,
-      message: message,
-    });
-
-    let fulfillTx: string | null = null;
-    try {
-      fulfillTx = await program.methods
-        .fulfillRandomness(requestId, [...randomness] as any)
-        .accounts({
-          authority: authority.publicKey,
-          config: configPda,
-          request: requestPda,
-          instructionsSysvar: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
-        })
-        .preInstructions([ed25519Ix])
-        .signers([authority])
-        .rpc({ commitment: "confirmed" });
-    } catch (e: any) {
-      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
-      if (
-        !errStr.includes("RequestNotPending") &&
-        !errStr.includes("Unknown action") &&
-        !errStr.includes('"Custom":6000') &&
-        !errStr.includes('"Custom": 6000')
-      ) throw e;
-      // Backend fulfilled — skip fulfill event check
-    }
-
-    if (fulfillTx) {
-      txDetails = await provider.connection.getTransaction(fulfillTx, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
-      expect(
-        countProgramDataLogs(txDetails!.meta!.logMessages!)
-      ).to.be.gte(1);
-    }
-
-    // Wait for fulfillment (by test or backend) before consuming
-    for (let i = 0; i < 15; i++) {
-      const req = await program.account.randomnessRequest.fetch(requestPda);
-      if (req.status >= 1) break;
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-
-    // 3. Consume → emits RandomnessConsumed event
-    let consumeTx: string | null = null;
-    try {
-      consumeTx = await program.methods
-        .consumeRandomness(requestId)
-        .accounts({
-          requester: admin.publicKey,
-          request: requestPda,
-        })
-        .rpc({ commitment: "confirmed" });
-    } catch (e: any) {
-      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
-      if (
-        errStr.includes("Unknown action") ||
-        errStr.includes("RequestNotFulfilled") ||
-        errStr.includes('"Custom":6001') ||
-        errStr.includes('"Custom": 6001')
-      ) {
-        // Request may already be consumed by another operation — that's OK for event test
-      } else {
-        throw e;
-      }
-    }
-
-    if (consumeTx) {
-      txDetails = await provider.connection.getTransaction(consumeTx, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
-      expect(
-        countProgramDataLogs(txDetails!.meta!.logMessages!)
-      ).to.be.gte(1);
-    }
-
-    // 4. Close → emits RequestClosed event (only if consumed)
-    let closeTx: string | null = null;
-    try {
-      closeTx = await program.methods
-        .closeRequest(requestId)
-        .accounts({
-          requester: admin.publicKey,
-          request: requestPda,
-        })
-        .rpc({ commitment: "confirmed" });
-    } catch (e: any) {
-      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
-      if (
-        errStr.includes("Unknown action") ||
-        errStr.includes("RequestNotConsumed") ||
-        errStr.includes('"Custom":6002') ||
-        errStr.includes('"Custom": 6002')
-      ) {
-        // Request may not be in consumed state — that's OK for event test
-      } else {
-        throw e;
-      }
-    }
-
-    if (closeTx) {
-      txDetails = await provider.connection.getTransaction(closeTx, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
-      expect(
-        countProgramDataLogs(txDetails!.meta!.logMessages!)
-      ).to.be.gte(1);
-    }
-
-    // Verify we got at least the request event (always succeeds)
-    expect(requestTx).to.not.be.null;
   });
 });

@@ -1479,6 +1479,7 @@ name = "vrf-sol"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "sha2",
  "solana-sdk-ids",
 ]
 

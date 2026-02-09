@@ -1,16 +1,10 @@
-//! On-chain event listener for the VRF program.
+//! On-chain event listener for the VRF coordinator program.
 //!
 //! Two complementary strategies ensure no requests are missed:
 //!
-//! 1. **Catch-up scan** ([`catch_up_pending_requests`]) — on startup, queries
-//!    `getProgramAccounts` for any existing `Pending` requests that arrived
-//!    while the backend was offline.
-//!
-//! 2. **Live stream** ([`listen_for_events`]) — subscribes to program log
-//!    events via WebSocket, parses `RandomnessRequested` Anchor events in
-//!    real-time, and auto-reconnects with exponential backoff on disconnection.
-//!
-//! Also supports ZK Compressed requests via the Photon indexer when configured.
+//! 1. **Catch-up scan** — on startup, queries `getProgramAccounts` for any
+//!    existing `Pending` requests.
+//! 2. **Live stream** — subscribes to program log events via WebSocket.
 
 use base64::Engine;
 use solana_account_decoder::UiAccountEncoding;
@@ -30,33 +24,19 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use crate::metrics::Metrics;
-use crate::photon::PhotonClient;
 use std::sync::Arc;
 
-/// Parsed representation of the on-chain `RandomnessRequested` Anchor event.
+/// Parsed representation of the on-chain `RandomWordsRequested` event.
 #[derive(Debug, Clone)]
-pub struct RandomnessRequestedEvent {
+pub struct RandomWordsRequestedEvent {
     pub request_id: u64,
+    pub subscription_id: u64,
+    pub consumer_program: Pubkey,
     pub requester: Pubkey,
+    pub num_words: u32,
     pub seed: [u8; 32],
     pub request_slot: u64,
-}
-
-/// A fulfillment request — either regular (PDA) or compressed (Light Protocol).
-#[derive(Debug, Clone)]
-pub enum FulfillmentRequest {
-    /// Regular request backed by an on-chain PDA.
-    Regular(RandomnessRequestedEvent),
-    /// Compressed request backed by a Light Protocol compressed account.
-    Compressed(CompressedFulfillmentRequest),
-}
-
-/// Data needed to fulfill a compressed randomness request.
-#[derive(Debug, Clone)]
-pub struct CompressedFulfillmentRequest {
-    pub event: RandomnessRequestedEvent,
-    /// Compressed account address.
-    pub address: [u8; 32],
+    pub callback_compute_limit: u32,
 }
 
 /// Compute the Anchor event discriminator: `sha256("event:<Name>")[..8]`.
@@ -83,17 +63,22 @@ fn account_discriminator(account_name: &str) -> [u8; 8] {
 
 /// Minimum WebSocket reconnect delay.
 const WS_RECONNECT_MIN: Duration = Duration::from_secs(1);
-/// Maximum WebSocket reconnect delay (capped exponential backoff).
+/// Maximum WebSocket reconnect delay.
 const WS_RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 /// Minimum expected account data length for a `RandomnessRequest`.
 ///
-/// Layout: discriminator (8) + request_id (8) + requester (32) + seed (32) +
-/// request_slot (8) + callback_program (32) + status (1) = 121 bytes.
-const MIN_ACCOUNT_DATA_LEN: usize = 121;
+/// Layout: discriminator (8) + request_id (8) + subscription_id (8) +
+/// consumer_program (32) + requester (32) + num_words (4) + seed (32) +
+/// request_slot (8) + callback_compute_limit (4) + status (1) = 137 bytes.
+const MIN_ACCOUNT_DATA_LEN: usize = 137;
 
-/// Tracks request IDs that have already been dispatched to prevent duplicate
-/// fulfillment attempts when catch-up and WebSocket streams overlap.
+/// Offset of the status byte in the RandomnessRequest account data.
+/// discriminator(8) + request_id(8) + subscription_id(8) + consumer_program(32) +
+/// requester(32) + num_words(4) + seed(32) + request_slot(8) + callback_compute_limit(4) = 136
+const STATUS_OFFSET: usize = 136;
+
+/// Tracks request IDs that have already been dispatched.
 struct Deduplicator {
     seen: Mutex<HashSet<u64>>,
 }
@@ -105,22 +90,15 @@ impl Deduplicator {
         }
     }
 
-    /// Returns `true` if this is the first time seeing this request ID.
     fn insert(&self, request_id: u64) -> bool {
         self.seen.lock().unwrap().insert(request_id)
     }
 }
 
 /// Scan for any existing unfulfilled (Pending) requests on startup.
-///
-/// Uses `getProgramAccounts` with Memcmp filters to find request PDAs where:
-/// - The account discriminator matches `RandomnessRequest`.
-/// - The status byte at offset 120 is `0` (Pending).
-///
-/// Each found request is sent through the channel for fulfillment.
 pub async fn catch_up_pending_requests(
     config: &AppConfig,
-    tx: &mpsc::Sender<FulfillmentRequest>,
+    tx: &mpsc::Sender<RandomWordsRequestedEvent>,
     metrics: &Arc<Metrics>,
 ) {
     info!("Scanning for pending requests");
@@ -129,17 +107,9 @@ pub async fn catch_up_pending_requests(
 
     let disc = account_discriminator("RandomnessRequest");
 
-    // Account data layout (offsets include the 8-byte discriminator):
-    //   [0..8]     discriminator
-    //   [8..16]    request_id   (u64)
-    //   [16..48]   requester    (Pubkey)
-    //   [48..80]   seed         ([u8; 32])
-    //   [80..88]   request_slot (u64)
-    //   [88..120]  callback_program (Pubkey)
-    //   [120]      status       (u8)  — 0 = Pending
     let filters = vec![
         RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, disc.to_vec())),
-        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(120, vec![0u8])), // Pending
+        RpcFilterType::Memcmp(Memcmp::new_raw_bytes(STATUS_OFFSET, vec![0u8])), // Pending
     ];
 
     let account_config = RpcProgramAccountsConfig {
@@ -176,41 +146,22 @@ pub async fn catch_up_pending_requests(
                     continue;
                 }
 
-                // Skip the 8-byte discriminator, then parse fixed-layout fields.
-                let body = &data[8..];
-                let Ok(request_id_bytes) = body[0..8].try_into() else {
-                    warn!(account = %pubkey, "Failed to parse request_id, skipping");
+                let Some(event) = parse_request_account_data(&data[8..]) else {
+                    warn!(account = %pubkey, "Failed to parse request account data, skipping");
                     continue;
                 };
-                let request_id = u64::from_le_bytes(request_id_bytes);
-                let Ok(requester) = Pubkey::try_from(&body[8..40]) else {
-                    warn!(account = %pubkey, "Failed to parse requester pubkey, skipping");
-                    continue;
-                };
-                let mut seed = [0u8; 32];
-                seed.copy_from_slice(&body[40..72]);
-                let Ok(slot_bytes) = body[72..80].try_into() else {
-                    warn!(account = %pubkey, "Failed to parse request_slot, skipping");
-                    continue;
-                };
-                let request_slot = u64::from_le_bytes(slot_bytes);
 
                 info!(
-                    request_id,
-                    requester = %requester,
-                    slot = request_slot,
+                    request_id = event.request_id,
+                    requester = %event.requester,
+                    consumer = %event.consumer_program,
+                    slot = event.request_slot,
                     "Queued pending request"
                 );
 
                 metrics.record_request();
 
-                let event = RandomnessRequestedEvent {
-                    request_id,
-                    requester,
-                    seed,
-                    request_slot,
-                };
-                if tx.send(FulfillmentRequest::Regular(event)).await.is_err() {
+                if tx.send(event).await.is_err() {
                     error!("Channel closed while catching up pending requests");
                     return;
                 }
@@ -222,54 +173,13 @@ pub async fn catch_up_pending_requests(
     }
 }
 
-/// Scan for pending compressed requests via the Photon indexer.
-pub async fn catch_up_compressed_requests(
-    config: &AppConfig,
-    photon: &PhotonClient,
-    tx: &mpsc::Sender<FulfillmentRequest>,
-    metrics: &Arc<Metrics>,
-) {
-    info!("Scanning Photon for pending compressed requests");
-
-    match photon.find_pending_compressed_requests(&config.program_id).await {
-        Ok(accounts) => {
-            info!(count = accounts.len(), "Found pending compressed requests");
-            for account in accounts {
-                let event = RandomnessRequestedEvent {
-                    request_id: account.request.request_id,
-                    requester: account.request.requester,
-                    seed: account.request.seed,
-                    request_slot: account.request.request_slot,
-                };
-
-                metrics.record_compressed_request();
-
-                let req = FulfillmentRequest::Compressed(CompressedFulfillmentRequest {
-                    event,
-                    address: account.address,
-                });
-
-                if tx.send(req).await.is_err() {
-                    error!("Channel closed while catching up compressed requests");
-                    return;
-                }
-            }
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to fetch compressed accounts from Photon");
-        }
-    }
-}
-
-/// Subscribe to program logs via WebSocket and forward `RandomnessRequested`
-/// events to the fulfiller. Automatically reconnects with exponential backoff.
+/// Subscribe to program logs via WebSocket and forward events to the fulfiller.
 pub async fn listen_for_events(
     config: AppConfig,
-    tx: mpsc::Sender<FulfillmentRequest>,
+    tx: mpsc::Sender<RandomWordsRequestedEvent>,
     metrics: Arc<Metrics>,
 ) {
-    let regular_discriminator = event_discriminator("RandomnessRequested");
-    let compressed_discriminator = event_discriminator("CompressedRandomnessRequested");
+    let event_disc = event_discriminator("RandomWordsRequested");
     let dedup = Deduplicator::new();
     let mut reconnect_delay = WS_RECONNECT_MIN;
 
@@ -279,7 +189,6 @@ pub async fn listen_for_events(
         match PubsubClient::new(&config.ws_url).await {
             Ok(pubsub) => {
                 info!("WebSocket connected");
-                // Reset backoff on successful connection
                 reconnect_delay = WS_RECONNECT_MIN;
 
                 let filter =
@@ -294,8 +203,7 @@ pub async fn listen_for_events(
                         while let Some(log_result) = stream.next().await {
                             process_log_lines(
                                 &log_result.value.logs,
-                                &regular_discriminator,
-                                &compressed_discriminator,
+                                &event_disc,
                                 &tx,
                                 &dedup,
                                 &metrics,
@@ -316,18 +224,15 @@ pub async fn listen_for_events(
 
         info!(delay = ?reconnect_delay, "Reconnecting");
         tokio::time::sleep(reconnect_delay).await;
-        // Exponential backoff capped at WS_RECONNECT_MAX
         reconnect_delay = (reconnect_delay * 2).min(WS_RECONNECT_MAX);
     }
 }
 
-/// Scan transaction log lines for `Program data:` entries that match either
-/// `RandomnessRequested` or `CompressedRandomnessRequested` event discriminators.
+/// Scan transaction log lines for `RandomWordsRequested` events.
 async fn process_log_lines(
     logs: &[String],
-    regular_discriminator: &[u8; 8],
-    compressed_discriminator: &[u8; 8],
-    tx: &mpsc::Sender<FulfillmentRequest>,
+    event_disc: &[u8; 8],
+    tx: &mpsc::Sender<RandomWordsRequestedEvent>,
     dedup: &Deduplicator,
     metrics: &Arc<Metrics>,
 ) {
@@ -351,10 +256,9 @@ async fn process_log_lines(
         let disc = &decoded[..8];
         let payload = &decoded[8..];
 
-        // Check if it's a regular request event
-        if disc == regular_discriminator {
-            let Some(event) = parse_randomness_requested_event(payload) else {
-                warn!("Failed to parse RandomnessRequested event payload");
+        if disc == event_disc {
+            let Some(event) = parse_random_words_requested_event(payload) else {
+                warn!("Failed to parse RandomWordsRequested event payload");
                 continue;
             };
 
@@ -368,47 +272,13 @@ async fn process_log_lines(
             info!(
                 request_id = event.request_id,
                 requester = %event.requester,
+                consumer = %event.consumer_program,
+                num_words = event.num_words,
                 slot = event.request_slot,
-                "Received RandomnessRequested event"
+                "Received RandomWordsRequested event"
             );
 
-            if tx.send(FulfillmentRequest::Regular(event)).await.is_err() {
-                error!("Channel closed, stopping listener");
-                return;
-            }
-            continue;
-        }
-
-        // Check if it's a compressed request event
-        if disc == compressed_discriminator {
-            let Some(event) = parse_randomness_requested_event(payload) else {
-                warn!("Failed to parse CompressedRandomnessRequested event payload");
-                continue;
-            };
-
-            if !dedup.insert(event.request_id) {
-                debug!(request_id = event.request_id, "Duplicate compressed request, skipping");
-                continue;
-            }
-
-            metrics.record_compressed_request();
-
-            info!(
-                request_id = event.request_id,
-                requester = %event.requester,
-                slot = event.request_slot,
-                compressed = true,
-                "Received CompressedRandomnessRequested event"
-            );
-
-            // For compressed requests, we don't have the address from the event alone.
-            // The fulfiller will query Photon to find the compressed account.
-            let req = FulfillmentRequest::Compressed(CompressedFulfillmentRequest {
-                event,
-                address: [0u8; 32], // Will be resolved by fulfiller via Photon
-            });
-
-            if tx.send(req).await.is_err() {
+            if tx.send(event).await.is_err() {
                 error!("Channel closed, stopping listener");
                 return;
             }
@@ -416,25 +286,65 @@ async fn process_log_lines(
     }
 }
 
-/// Deserialize a `RandomnessRequested` event from its Borsh-encoded body
-/// (after the 8-byte discriminator has been stripped).
+/// Parse a `RandomWordsRequested` event from its body (after discriminator).
 ///
-/// Layout: `request_id (8) + requester (32) + seed (32) + request_slot (8) = 80 bytes`.
-fn parse_randomness_requested_event(data: &[u8]) -> Option<RandomnessRequestedEvent> {
-    if data.len() < 80 {
+/// Layout: request_id(8) + subscription_id(8) + consumer_program(32) +
+/// requester(32) + num_words(4) + seed(32) + request_slot(8) + callback_compute_limit(4) = 128 bytes.
+fn parse_random_words_requested_event(data: &[u8]) -> Option<RandomWordsRequestedEvent> {
+    if data.len() < 128 {
         return None;
     }
 
     let request_id = u64::from_le_bytes(data[0..8].try_into().ok()?);
-    let requester = Pubkey::try_from(&data[8..40]).ok()?;
+    let subscription_id = u64::from_le_bytes(data[8..16].try_into().ok()?);
+    let consumer_program = Pubkey::try_from(&data[16..48]).ok()?;
+    let requester = Pubkey::try_from(&data[48..80]).ok()?;
+    let num_words = u32::from_le_bytes(data[80..84].try_into().ok()?);
     let mut seed = [0u8; 32];
-    seed.copy_from_slice(&data[40..72]);
-    let request_slot = u64::from_le_bytes(data[72..80].try_into().ok()?);
+    seed.copy_from_slice(&data[84..116]);
+    let request_slot = u64::from_le_bytes(data[116..124].try_into().ok()?);
+    let callback_compute_limit = u32::from_le_bytes(data[124..128].try_into().ok()?);
 
-    Some(RandomnessRequestedEvent {
+    Some(RandomWordsRequestedEvent {
         request_id,
+        subscription_id,
+        consumer_program,
         requester,
+        num_words,
         seed,
         request_slot,
+        callback_compute_limit,
+    })
+}
+
+/// Parse a RandomnessRequest account body (after discriminator).
+///
+/// Layout: request_id(8) + subscription_id(8) + consumer_program(32) +
+/// requester(32) + num_words(4) + seed(32) + request_slot(8) + callback_compute_limit(4) +
+/// status(1) + randomness(32) + fulfilled_slot(8) + bump(1)
+fn parse_request_account_data(body: &[u8]) -> Option<RandomWordsRequestedEvent> {
+    if body.len() < MIN_ACCOUNT_DATA_LEN - 8 {
+        return None;
+    }
+
+    let request_id = u64::from_le_bytes(body[0..8].try_into().ok()?);
+    let subscription_id = u64::from_le_bytes(body[8..16].try_into().ok()?);
+    let consumer_program = Pubkey::try_from(&body[16..48]).ok()?;
+    let requester = Pubkey::try_from(&body[48..80]).ok()?;
+    let num_words = u32::from_le_bytes(body[80..84].try_into().ok()?);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&body[84..116]);
+    let request_slot = u64::from_le_bytes(body[116..124].try_into().ok()?);
+    let callback_compute_limit = u32::from_le_bytes(body[124..128].try_into().ok()?);
+
+    Some(RandomWordsRequestedEvent {
+        request_id,
+        subscription_id,
+        consumer_program,
+        requester,
+        num_words,
+        seed,
+        request_slot,
+        callback_compute_limit,
     })
 }

@@ -5,55 +5,56 @@ import {
   Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
-import {
-  CompressedRandomnessRequest as CompressedRequest,
-  CompressedRandomnessOptions,
-  fetchCompressedRequests,
-  waitForCompressedFulfillment,
-} from "./compressed";
 import BN from "bn.js";
-import { randomBytes } from "crypto";
 import { VRF_PROGRAM_ID } from "./constants";
-import { getConfigPda, getRequestPda } from "./pda";
-import { decodeVrfConfig, decodeRandomnessRequest } from "./accounts";
 import {
-  createRequestRandomnessInstruction,
-  createRequestRandomnessWithCallbackInstruction,
-  createConsumeRandomnessInstruction,
-  createCloseRequestInstruction,
+  getConfigPda,
+  getSubscriptionPda,
+  getConsumerPda,
+  getRequestPda,
+} from "./pda";
+import {
+  decodeCoordinatorConfig,
+  decodeSubscription,
+  decodeConsumerRegistration,
+  decodeRandomnessRequest,
+} from "./accounts";
+import {
+  createInitializeInstruction,
+  createCreateSubscriptionInstruction,
+  createFundSubscriptionInstruction,
+  createAddConsumerInstruction,
+  createRemoveConsumerInstruction,
+  createCancelSubscriptionInstruction,
 } from "./instructions";
 import { waitForFulfillment, addPriorityFee } from "./utils";
 import {
-  VrfConfig,
+  CoordinatorConfig,
+  SubscriptionAccount,
+  ConsumerRegistrationAccount,
   RandomnessRequestAccount,
-  RequestRandomnessResult,
+  CreateSubscriptionResult,
   WaitForFulfillmentOptions,
-  GetRandomnessOptions,
-  GetRandomnessResult,
 } from "./types";
 
 /**
- * High-level client for the Moirae VRF oracle on Solana.
+ * High-level client for the Moirae VRF coordinator on Solana.
  *
- * @example Simplest usage — one line to get randomness:
+ * The coordinator uses a subscription-based model with automatic callback delivery.
+ * Consumer programs CPI into the coordinator to request randomness, and the coordinator
+ * CPIs back into the consumer with the random words after fulfillment.
+ *
+ * @example Subscription management:
  * ```ts
  * const vrf = new MoiraeVrf(connection);
- * const { randomness } = await vrf.getRandomness(payer);
- * ```
- *
- * @example Full control:
- * ```ts
- * const vrf = new MoiraeVrf(connection);
- * const { requestId } = await vrf.requestRandomness(payer, seed);
- * const { randomness } = await vrf.waitForFulfillment(requestId);
- * await vrf.consumeRandomness(payer, requestId);
- * await vrf.closeRequest(payer, requestId);
+ * const { subscriptionId } = await vrf.createSubscription(admin);
+ * await vrf.fundSubscription(admin, subscriptionId, new BN(1_000_000_000));
+ * await vrf.addConsumer(admin, subscriptionId, myConsumerProgram);
  * ```
  */
 export class MoiraeVrf {
   public readonly connection: Connection;
   public readonly programId: PublicKey;
-  private photonRpcUrl?: string;
 
   constructor(
     connection: Connection,
@@ -63,18 +64,22 @@ export class MoiraeVrf {
     this.programId = programId;
   }
 
-  /**
-   * Set the Photon indexer RPC URL for compressed request support.
-   * Required for `getRandomnessCompressed` and related methods.
-   */
-  setPhotonRpcUrl(url: string): this {
-    this.photonRpcUrl = url;
-    return this;
-  }
-
-  /** Get the config PDA address. */
+  /** Get the coordinator config PDA address. */
   getConfigPda(): PublicKey {
     return getConfigPda(this.programId)[0];
+  }
+
+  /** Get a subscription PDA address for a given subscription ID. */
+  getSubscriptionPda(subscriptionId: BN | number | bigint): PublicKey {
+    return getSubscriptionPda(subscriptionId, this.programId)[0];
+  }
+
+  /** Get a consumer registration PDA address. */
+  getConsumerPda(
+    subscriptionId: BN | number | bigint,
+    consumerProgramId: PublicKey
+  ): PublicKey {
+    return getConsumerPda(subscriptionId, consumerProgramId, this.programId)[0];
   }
 
   /** Get a request PDA address for a given request ID. */
@@ -82,14 +87,47 @@ export class MoiraeVrf {
     return getRequestPda(requestId, this.programId)[0];
   }
 
-  /** Fetch and deserialize the VRF configuration account. */
-  async getConfig(): Promise<VrfConfig> {
+  /** Fetch and deserialize the coordinator configuration account. */
+  async getConfig(): Promise<CoordinatorConfig> {
     const [configPda] = getConfigPda(this.programId);
     const accountInfo = await this.connection.getAccountInfo(configPda);
     if (!accountInfo) {
-      throw new Error("VRF configuration account not found");
+      throw new Error("Coordinator configuration account not found");
     }
-    return decodeVrfConfig(Buffer.from(accountInfo.data));
+    return decodeCoordinatorConfig(Buffer.from(accountInfo.data));
+  }
+
+  /** Fetch and deserialize a subscription account. */
+  async getSubscription(
+    subscriptionId: BN | number | bigint
+  ): Promise<SubscriptionAccount> {
+    const [subscriptionPda] = getSubscriptionPda(subscriptionId, this.programId);
+    const accountInfo = await this.connection.getAccountInfo(subscriptionPda);
+    if (!accountInfo) {
+      throw new Error(
+        `Subscription account not found for ID ${subscriptionId.toString()}`
+      );
+    }
+    return decodeSubscription(Buffer.from(accountInfo.data));
+  }
+
+  /** Fetch and deserialize a consumer registration account. */
+  async getConsumerRegistration(
+    subscriptionId: BN | number | bigint,
+    consumerProgramId: PublicKey
+  ): Promise<ConsumerRegistrationAccount> {
+    const [consumerPda] = getConsumerPda(
+      subscriptionId,
+      consumerProgramId,
+      this.programId
+    );
+    const accountInfo = await this.connection.getAccountInfo(consumerPda);
+    if (!accountInfo) {
+      throw new Error(
+        `Consumer registration not found for subscription ${subscriptionId.toString()} and program ${consumerProgramId.toBase58()}`
+      );
+    }
+    return decodeConsumerRegistration(Buffer.from(accountInfo.data));
   }
 
   /** Fetch and deserialize a randomness request account. */
@@ -112,30 +150,33 @@ export class MoiraeVrf {
     return config.requestCounter;
   }
 
-  /**
-   * Submit a randomness request transaction.
-   *
-   * @param payer - The keypair paying for the request (signs the transaction).
-   * @param seed - 32-byte user-provided entropy.
-   * @param priorityFee - Optional priority fee in micro-lamports.
-   * @returns The request ID and PDA address.
-   */
-  async requestRandomness(
-    payer: Keypair,
-    seed: Uint8Array | Buffer,
-    priorityFee?: number
-  ): Promise<RequestRandomnessResult> {
+  /** Get the next subscription ID from the config counter. */
+  async getNextSubscriptionId(): Promise<BN> {
     const config = await this.getConfig();
-    const requestId = config.requestCounter;
-    const [configPda] = getConfigPda(this.programId);
-    const [requestPda] = getRequestPda(requestId, this.programId);
+    return config.subscriptionCounter;
+  }
 
-    const ix = createRequestRandomnessInstruction(
+  // ---------------------------------------------------------------------------
+  // Subscription management
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a new subscription.
+   *
+   * @param payer - The keypair creating the subscription (becomes owner).
+   * @param priorityFee - Optional priority fee in micro-lamports.
+   * @returns The subscription ID and PDA address.
+   */
+  async createSubscription(
+    payer: Keypair,
+    priorityFee?: number
+  ): Promise<CreateSubscriptionResult> {
+    const config = await this.getConfig();
+    const subscriptionId = config.subscriptionCounter;
+
+    const ix = createCreateSubscriptionInstruction(
       payer.publicKey,
-      configPda,
-      requestPda,
-      config.treasury,
-      seed,
+      subscriptionId,
       this.programId
     );
 
@@ -147,55 +188,109 @@ export class MoiraeVrf {
 
     await sendAndConfirmTransaction(this.connection, tx, [payer]);
 
-    return { requestId, requestPda };
+    const [subscriptionPda] = getSubscriptionPda(subscriptionId, this.programId);
+    return { subscriptionId, subscriptionPda };
   }
 
   /**
-   * Submit a randomness request with a callback program.
+   * Fund a subscription with SOL.
    *
-   * After fulfillment, the oracle will CPI into the callback program
-   * with the randomness output.
-   *
-   * @param payer - The keypair paying for the request.
-   * @param seed - 32-byte user-provided entropy.
-   * @param callbackProgram - The program to receive the callback after fulfillment.
-   * @param priorityFee - Optional priority fee in micro-lamports.
-   * @returns The request ID and PDA address.
+   * @param payer - The keypair funding the subscription.
+   * @param subscriptionId - The subscription to fund.
+   * @param amount - Amount in lamports to add.
    */
-  async requestRandomnessWithCallback(
+  async fundSubscription(
     payer: Keypair,
-    seed: Uint8Array | Buffer,
-    callbackProgram: PublicKey,
-    priorityFee?: number
-  ): Promise<RequestRandomnessResult> {
-    const config = await this.getConfig();
-    const requestId = config.requestCounter;
-    const [configPda] = getConfigPda(this.programId);
-    const [requestPda] = getRequestPda(requestId, this.programId);
-
-    const ix = createRequestRandomnessWithCallbackInstruction(
+    subscriptionId: BN | number,
+    amount: BN
+  ): Promise<void> {
+    const ix = createFundSubscriptionInstruction(
       payer.publicKey,
-      configPda,
-      requestPda,
-      config.treasury,
-      callbackProgram,
-      seed,
+      subscriptionId,
+      amount,
       this.programId
     );
 
-    const tx = new Transaction();
-    if (priorityFee !== undefined) {
-      tx.add(...addPriorityFee(priorityFee));
-    }
-    tx.add(ix);
-
+    const tx = new Transaction().add(ix);
     await sendAndConfirmTransaction(this.connection, tx, [payer]);
-
-    return { requestId, requestPda };
   }
+
+  /**
+   * Register a consumer program for a subscription.
+   *
+   * @param owner - The subscription owner keypair.
+   * @param subscriptionId - The subscription ID.
+   * @param consumerProgramId - The program to register as a consumer.
+   */
+  async addConsumer(
+    owner: Keypair,
+    subscriptionId: BN | number,
+    consumerProgramId: PublicKey
+  ): Promise<void> {
+    const ix = createAddConsumerInstruction(
+      owner.publicKey,
+      subscriptionId,
+      consumerProgramId,
+      this.programId
+    );
+
+    const tx = new Transaction().add(ix);
+    await sendAndConfirmTransaction(this.connection, tx, [owner]);
+  }
+
+  /**
+   * Remove a consumer program from a subscription.
+   *
+   * @param owner - The subscription owner keypair.
+   * @param subscriptionId - The subscription ID.
+   * @param consumerProgramId - The program to remove.
+   */
+  async removeConsumer(
+    owner: Keypair,
+    subscriptionId: BN | number,
+    consumerProgramId: PublicKey
+  ): Promise<void> {
+    const ix = createRemoveConsumerInstruction(
+      owner.publicKey,
+      subscriptionId,
+      consumerProgramId,
+      this.programId
+    );
+
+    const tx = new Transaction().add(ix);
+    await sendAndConfirmTransaction(this.connection, tx, [owner]);
+  }
+
+  /**
+   * Cancel a subscription and reclaim its balance.
+   * Requires all consumers to be removed first.
+   *
+   * @param owner - The subscription owner keypair.
+   * @param subscriptionId - The subscription to cancel.
+   */
+  async cancelSubscription(
+    owner: Keypair,
+    subscriptionId: BN | number
+  ): Promise<void> {
+    const ix = createCancelSubscriptionInstruction(
+      owner.publicKey,
+      subscriptionId,
+      this.programId
+    );
+
+    const tx = new Transaction().add(ix);
+    await sendAndConfirmTransaction(this.connection, tx, [owner]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Request monitoring
+  // ---------------------------------------------------------------------------
 
   /**
    * Wait for the oracle to fulfill a request.
+   *
+   * Note: In the callback model, the request PDA is closed after fulfillment.
+   * This method may throw if the PDA was already closed.
    *
    * @returns The fulfilled request account with randomness.
    */
@@ -205,167 +300,6 @@ export class MoiraeVrf {
   ): Promise<RandomnessRequestAccount> {
     return waitForFulfillment(
       this.connection,
-      requestId,
-      this.programId,
-      opts
-    );
-  }
-
-  /**
-   * Consume a fulfilled randomness request.
-   *
-   * @param payer - The original requester keypair.
-   * @param requestId - The request ID to consume.
-   */
-  async consumeRandomness(
-    payer: Keypair,
-    requestId: BN | number | bigint
-  ): Promise<void> {
-    const [requestPda] = getRequestPda(requestId, this.programId);
-    const ix = createConsumeRandomnessInstruction(
-      payer.publicKey,
-      requestPda,
-      requestId,
-      this.programId
-    );
-
-    const tx = new Transaction().add(ix);
-    await sendAndConfirmTransaction(this.connection, tx, [payer]);
-  }
-
-  /**
-   * Close a consumed request and reclaim rent.
-   *
-   * @param payer - The original requester keypair.
-   * @param requestId - The request ID to close.
-   */
-  async closeRequest(
-    payer: Keypair,
-    requestId: BN | number | bigint
-  ): Promise<void> {
-    const [requestPda] = getRequestPda(requestId, this.programId);
-    const ix = createCloseRequestInstruction(
-      payer.publicKey,
-      requestPda,
-      requestId,
-      this.programId
-    );
-
-    const tx = new Transaction().add(ix);
-    await sendAndConfirmTransaction(this.connection, tx, [payer]);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Convenience methods — simplest possible API
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Get random bytes in one call.
-   *
-   * Handles the full lifecycle: request → wait → consume → close.
-   * Returns the 32-byte randomness output. This is the simplest way
-   * to get verifiable randomness on Solana.
-   *
-   * @example
-   * ```ts
-   * const vrf = new MoiraeVrf(connection);
-   * const { randomness } = await vrf.getRandomness(payer);
-   * console.log("Random:", Buffer.from(randomness).toString("hex"));
-   * ```
-   *
-   * @param payer - The keypair paying for the request (signs the transaction).
-   * @param opts - Optional seed, priority fee, and timeout settings.
-   */
-  async getRandomness(
-    payer: Keypair,
-    opts: GetRandomnessOptions = {}
-  ): Promise<GetRandomnessResult> {
-    const seed = opts.seed ?? randomBytes(32);
-    const { requestId, requestPda } = await this.requestRandomness(
-      payer,
-      seed,
-      opts.priorityFee
-    );
-
-    const fulfilled = await this.waitForFulfillment(requestId, {
-      timeout: opts.timeout ?? 60_000,
-      interval: opts.interval,
-    });
-
-    await this.consumeRandomness(payer, requestId);
-    await this.closeRequest(payer, requestId);
-
-    return {
-      randomness: fulfilled.randomness,
-      requestId,
-      requestPda,
-    };
-  }
-
-  /**
-   * Request randomness and wait for the oracle to fulfill it.
-   *
-   * Like `getRandomness` but does NOT consume or close — useful when
-   * your on-chain program needs to read the request account.
-   *
-   * @param payer - The keypair paying for the request.
-   * @param opts - Optional seed, priority fee, and timeout settings.
-   * @returns The fulfilled request account with randomness.
-   */
-  async requestAndWait(
-    payer: Keypair,
-    opts: GetRandomnessOptions = {}
-  ): Promise<RandomnessRequestAccount & { requestId: BN; requestPda: PublicKey }> {
-    const seed = opts.seed ?? randomBytes(32);
-    const { requestId, requestPda } = await this.requestRandomness(
-      payer,
-      seed,
-      opts.priorityFee
-    );
-
-    const fulfilled = await this.waitForFulfillment(requestId, {
-      timeout: opts.timeout ?? 60_000,
-      interval: opts.interval,
-    });
-
-    return { ...fulfilled, requestId, requestPda };
-  }
-
-  // ---------------------------------------------------------------------------
-  // ZK Compressed mode — zero-rent randomness via Light Protocol
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Fetch all compressed randomness requests from the Photon indexer.
-   *
-   * Requires `setPhotonRpcUrl()` to be called first.
-   */
-  async getCompressedRequests(): Promise<CompressedRequest[]> {
-    if (!this.photonRpcUrl) {
-      throw new Error(
-        "Photon RPC URL not set. Call setPhotonRpcUrl() first."
-      );
-    }
-    return fetchCompressedRequests(this.photonRpcUrl, this.programId);
-  }
-
-  /**
-   * Wait for a compressed randomness request to be fulfilled.
-   *
-   * Polls the Photon indexer until the request status changes to Fulfilled.
-   * Requires `setPhotonRpcUrl()` to be called first.
-   */
-  async waitForCompressedFulfillment(
-    requestId: BN | number | bigint,
-    opts?: { timeout?: number; interval?: number }
-  ): Promise<CompressedRequest> {
-    if (!this.photonRpcUrl) {
-      throw new Error(
-        "Photon RPC URL not set. Call setPhotonRpcUrl() first."
-      );
-    }
-    return waitForCompressedFulfillment(
-      this.photonRpcUrl,
       requestId,
       this.programId,
       opts

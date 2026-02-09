@@ -17,8 +17,11 @@ import {
 /**
  * Poll a randomness request until it reaches `Fulfilled` status.
  *
- * @returns The fulfilled request account.
- * @throws If the timeout is reached before fulfillment.
+ * Note: In the coordinator callback model, requests are typically closed
+ * after fulfillment. This function may return null if the request PDA
+ * was already closed by the coordinator.
+ *
+ * @returns The fulfilled request account, or throws if timeout is reached.
  */
 export async function waitForFulfillment(
   connection: Connection,
@@ -41,6 +44,12 @@ export async function waitForFulfillment(
       if (request.status >= RequestStatus.Fulfilled) {
         return request;
       }
+    } else if (accountInfo === null) {
+      // Request PDA was closed (fulfilled + callback completed).
+      // This is the expected outcome in the coordinator callback model.
+      throw new Error(
+        `Request ${requestId.toString()} PDA was closed (already fulfilled and callback delivered)`
+      );
     }
     await new Promise((resolve) => setTimeout(resolve, interval));
   }

@@ -5,36 +5,34 @@ import {
 } from "@solana/web3.js";
 import BN from "bn.js";
 import { DISCRIMINATORS, VRF_PROGRAM_ID } from "./constants";
-import { getConfigPda, getRequestPda } from "./pda";
+import { getConfigPda, getSubscriptionPda, getConsumerPda, getRequestPda } from "./pda";
 
 /**
- * Create a `request_randomness` instruction.
+ * Create an `initialize` instruction for the coordinator config.
  *
- * Accounts: [requester (signer, writable), config (writable), request (writable), treasury (writable), system_program]
+ * Accounts: [admin (signer, writable), authority, config (writable), system_program]
  */
-export function createRequestRandomnessInstruction(
-  requester: PublicKey,
-  configPda: PublicKey,
-  requestPda: PublicKey,
-  treasury: PublicKey,
-  seed: Uint8Array | Buffer,
+export function createInitializeInstruction(
+  admin: PublicKey,
+  authority: PublicKey,
+  feePerWord: BN,
+  maxNumWords: number,
   programId: PublicKey = VRF_PROGRAM_ID
 ): TransactionInstruction {
-  if (seed.length !== 32) {
-    throw new Error(`Seed must be 32 bytes, got ${seed.length}`);
-  }
+  const [configPda] = getConfigPda(programId);
 
-  const data = Buffer.alloc(8 + 32);
-  DISCRIMINATORS.requestRandomness.copy(data, 0);
-  Buffer.from(seed).copy(data, 8);
+  // data: disc(8) + fee_per_word(8) + max_num_words(4)
+  const data = Buffer.alloc(8 + 8 + 4);
+  DISCRIMINATORS.initialize.copy(data, 0);
+  feePerWord.toArrayLike(Buffer, "le", 8).copy(data, 8);
+  data.writeUInt32LE(maxNumWords, 16);
 
   return new TransactionInstruction({
     programId,
     keys: [
-      { pubkey: requester, isSigner: true, isWritable: true },
+      { pubkey: admin, isSigner: true, isWritable: true },
+      { pubkey: authority, isSigner: false, isWritable: false },
       { pubkey: configPda, isSigner: false, isWritable: true },
-      { pubkey: requestPda, isSigner: false, isWritable: true },
-      { pubkey: treasury, isSigner: false, isWritable: true },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data,
@@ -42,66 +40,27 @@ export function createRequestRandomnessInstruction(
 }
 
 /**
- * Create a `consume_randomness` instruction.
+ * Create a `create_subscription` instruction.
  *
- * Accounts: [requester (signer), request (writable)]
+ * Accounts: [owner (signer, writable), config (writable), subscription (writable), system_program]
  */
-export function createConsumeRandomnessInstruction(
-  requester: PublicKey,
-  requestPda: PublicKey,
-  requestId: BN | number | bigint,
+export function createCreateSubscriptionInstruction(
+  owner: PublicKey,
+  subscriptionId: BN | number,
   programId: PublicKey = VRF_PROGRAM_ID
 ): TransactionInstruction {
-  const id = new BN(requestId.toString());
-  const data = Buffer.alloc(8 + 8);
-  DISCRIMINATORS.consumeRandomness.copy(data, 0);
-  id.toArrayLike(Buffer, "le", 8).copy(data, 8);
+  const [configPda] = getConfigPda(programId);
+  const [subscriptionPda] = getSubscriptionPda(subscriptionId, programId);
+
+  const data = Buffer.alloc(8);
+  DISCRIMINATORS.createSubscription.copy(data, 0);
 
   return new TransactionInstruction({
     programId,
     keys: [
-      { pubkey: requester, isSigner: true, isWritable: false },
-      { pubkey: requestPda, isSigner: false, isWritable: true },
-    ],
-    data,
-  });
-}
-
-/**
- * Create a `close_request` instruction.
- *
- * Accounts: [requester (signer, writable), request (writable)]
- */
-/**
- * Create a `request_randomness_with_callback` instruction.
- *
- * Accounts: [requester (signer, writable), config (writable), request (writable), treasury (writable), callback_program, system_program]
- */
-export function createRequestRandomnessWithCallbackInstruction(
-  requester: PublicKey,
-  configPda: PublicKey,
-  requestPda: PublicKey,
-  treasury: PublicKey,
-  callbackProgram: PublicKey,
-  seed: Uint8Array | Buffer,
-  programId: PublicKey = VRF_PROGRAM_ID
-): TransactionInstruction {
-  if (seed.length !== 32) {
-    throw new Error(`Seed must be 32 bytes, got ${seed.length}`);
-  }
-
-  const data = Buffer.alloc(8 + 32);
-  DISCRIMINATORS.requestRandomnessWithCallback.copy(data, 0);
-  Buffer.from(seed).copy(data, 8);
-
-  return new TransactionInstruction({
-    programId,
-    keys: [
-      { pubkey: requester, isSigner: true, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: true },
       { pubkey: configPda, isSigner: false, isWritable: true },
-      { pubkey: requestPda, isSigner: false, isWritable: true },
-      { pubkey: treasury, isSigner: false, isWritable: true },
-      { pubkey: callbackProgram, isSigner: false, isWritable: false },
+      { pubkey: subscriptionPda, isSigner: false, isWritable: true },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data,
@@ -109,26 +68,123 @@ export function createRequestRandomnessWithCallbackInstruction(
 }
 
 /**
- * Create a `close_request` instruction.
+ * Create a `fund_subscription` instruction.
  *
- * Accounts: [requester (signer, writable), request (writable)]
+ * Accounts: [funder (signer, writable), subscription (writable), system_program]
  */
-export function createCloseRequestInstruction(
-  requester: PublicKey,
-  requestPda: PublicKey,
-  requestId: BN | number | bigint,
+export function createFundSubscriptionInstruction(
+  funder: PublicKey,
+  subscriptionId: BN | number,
+  amount: BN,
   programId: PublicKey = VRF_PROGRAM_ID
 ): TransactionInstruction {
-  const id = new BN(requestId.toString());
+  const [subscriptionPda] = getSubscriptionPda(subscriptionId, programId);
+  const id = new BN(subscriptionId.toString());
+
+  // data: disc(8) + subscription_id(8) + amount(8)
+  const data = Buffer.alloc(8 + 8 + 8);
+  DISCRIMINATORS.fundSubscription.copy(data, 0);
+  id.toArrayLike(Buffer, "le", 8).copy(data, 8);
+  amount.toArrayLike(Buffer, "le", 8).copy(data, 16);
+
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: funder, isSigner: true, isWritable: true },
+      { pubkey: subscriptionPda, isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+/**
+ * Create an `add_consumer` instruction.
+ *
+ * Accounts: [owner (signer, writable), subscription, consumer_program, consumer_registration (writable), system_program]
+ */
+export function createAddConsumerInstruction(
+  owner: PublicKey,
+  subscriptionId: BN | number,
+  consumerProgramId: PublicKey,
+  programId: PublicKey = VRF_PROGRAM_ID
+): TransactionInstruction {
+  const [subscriptionPda] = getSubscriptionPda(subscriptionId, programId);
+  const [consumerPda] = getConsumerPda(subscriptionId, consumerProgramId, programId);
+  const id = new BN(subscriptionId.toString());
+
+  // data: disc(8) + subscription_id(8)
   const data = Buffer.alloc(8 + 8);
-  DISCRIMINATORS.closeRequest.copy(data, 0);
+  DISCRIMINATORS.addConsumer.copy(data, 0);
   id.toArrayLike(Buffer, "le", 8).copy(data, 8);
 
   return new TransactionInstruction({
     programId,
     keys: [
-      { pubkey: requester, isSigner: true, isWritable: true },
-      { pubkey: requestPda, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: true },
+      { pubkey: subscriptionPda, isSigner: false, isWritable: true },
+      { pubkey: consumerProgramId, isSigner: false, isWritable: false },
+      { pubkey: consumerPda, isSigner: false, isWritable: true },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    ],
+    data,
+  });
+}
+
+/**
+ * Create a `remove_consumer` instruction.
+ *
+ * Accounts: [owner (signer, writable), subscription (writable), consumer_registration (writable)]
+ */
+export function createRemoveConsumerInstruction(
+  owner: PublicKey,
+  subscriptionId: BN | number,
+  consumerProgramId: PublicKey,
+  programId: PublicKey = VRF_PROGRAM_ID
+): TransactionInstruction {
+  const [subscriptionPda] = getSubscriptionPda(subscriptionId, programId);
+  const [consumerPda] = getConsumerPda(subscriptionId, consumerProgramId, programId);
+  const id = new BN(subscriptionId.toString());
+
+  // data: disc(8) + subscription_id(8)
+  const data = Buffer.alloc(8 + 8);
+  DISCRIMINATORS.removeConsumer.copy(data, 0);
+  id.toArrayLike(Buffer, "le", 8).copy(data, 8);
+
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: owner, isSigner: true, isWritable: true },
+      { pubkey: subscriptionPda, isSigner: false, isWritable: true },
+      { pubkey: consumerPda, isSigner: false, isWritable: true },
+    ],
+    data,
+  });
+}
+
+/**
+ * Create a `cancel_subscription` instruction.
+ *
+ * Accounts: [owner (signer, writable), subscription (writable)]
+ */
+export function createCancelSubscriptionInstruction(
+  owner: PublicKey,
+  subscriptionId: BN | number,
+  programId: PublicKey = VRF_PROGRAM_ID
+): TransactionInstruction {
+  const [subscriptionPda] = getSubscriptionPda(subscriptionId, programId);
+  const id = new BN(subscriptionId.toString());
+
+  // data: disc(8) + subscription_id(8)
+  const data = Buffer.alloc(8 + 8);
+  DISCRIMINATORS.cancelSubscription.copy(data, 0);
+  id.toArrayLike(Buffer, "le", 8).copy(data, 8);
+
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: owner, isSigner: true, isWritable: true },
+      { pubkey: subscriptionPda, isSigner: false, isWritable: true },
     ],
     data,
   });

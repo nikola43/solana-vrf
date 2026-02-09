@@ -12,44 +12,36 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 /// Application configuration for the VRF oracle backend.
-///
-/// Loaded once at startup via [`AppConfig::from_env`]. The `authority_keypair`
-/// is wrapped in `Arc` so the config can be cheaply cloned across async tasks.
 #[derive(Clone)]
 pub struct AppConfig {
     /// Solana JSON-RPC endpoint (HTTP).
     pub rpc_url: String,
     /// Solana PubSub endpoint (WebSocket) for log subscriptions.
     pub ws_url: String,
-    /// Ed25519 keypair used to sign fulfillment proofs. Must match the on-chain
-    /// `VrfConfiguration::authority`.
+    /// Ed25519 keypair used to sign fulfillment proofs.
     pub authority_keypair: Arc<Keypair>,
-    /// Secret key for HMAC-SHA256 randomness generation. Must be kept confidential;
-    /// if leaked, requesters could predict VRF outputs.
+    /// Secret key for HMAC-SHA256 randomness generation.
     pub hmac_secret: Vec<u8>,
-    /// The deployed VRF program ID to monitor and interact with.
+    /// The deployed VRF coordinator program ID.
     pub program_id: Pubkey,
-    /// Cluster name for explorer URLs (`devnet` or `mainnet-beta`).
+    /// The roll-dice consumer program ID (for deriving callback accounts).
+    pub dice_program_id: Option<Pubkey>,
+    /// Cluster name for explorer URLs.
     pub cluster: String,
-    /// HTTP server port for health/status/metrics endpoints.
+    /// HTTP server port.
     pub http_port: u16,
-    /// Maximum number of send-and-confirm retry attempts per fulfillment.
+    /// Maximum retry attempts per fulfillment.
     pub max_retries: u32,
-    /// Initial retry delay in milliseconds (doubles each attempt).
+    /// Initial retry delay in milliseconds.
     pub initial_retry_delay_ms: u64,
-    /// Priority fee in micro-lamports per compute unit (0 = no priority fee).
+    /// Priority fee in micro-lamports per compute unit.
     pub priority_fee_micro_lamports: u64,
-    /// Maximum number of concurrent fulfillment tasks.
+    /// Maximum concurrent fulfillment tasks.
     pub fulfillment_concurrency: usize,
-    /// Optional Photon indexer RPC URL for ZK Compressed account support.
-    /// If set, the backend will also listen for and fulfill compressed requests.
-    pub photon_rpc_url: Option<String>,
 }
 
 impl AppConfig {
     /// Load configuration from environment variables.
-    ///
-    /// Returns a descriptive error if any required variable is missing or invalid.
     pub fn from_env() -> Result<Self> {
         let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8899".into());
         let ws_url = std::env::var("WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:8900".into());
@@ -68,6 +60,10 @@ impl AppConfig {
         let program_id_str = std::env::var("PROGRAM_ID").context("PROGRAM_ID env var must be set")?;
         let program_id = Pubkey::from_str(&program_id_str)
             .with_context(|| format!("invalid PROGRAM_ID: {program_id_str}"))?;
+
+        let dice_program_id = std::env::var("DICE_PROGRAM_ID")
+            .ok()
+            .and_then(|s| Pubkey::from_str(&s).ok());
 
         let cluster =
             std::env::var("CLUSTER").unwrap_or_else(|_| "devnet".into());
@@ -97,21 +93,19 @@ impl AppConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
 
-        let photon_rpc_url = std::env::var("PHOTON_RPC_URL").ok();
-
         Ok(Self {
             rpc_url,
             ws_url,
             authority_keypair: Arc::new(authority_keypair),
             hmac_secret,
             program_id,
+            dice_program_id,
             cluster,
             http_port,
             max_retries,
             initial_retry_delay_ms,
             priority_fee_micro_lamports,
             fulfillment_concurrency,
-            photon_rpc_url,
         })
     }
 

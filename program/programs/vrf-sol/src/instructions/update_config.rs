@@ -1,36 +1,30 @@
 use anchor_lang::prelude::*;
 
 use crate::errors::VrfError;
-use crate::state::VrfConfiguration;
+use crate::state::CoordinatorConfig;
 
-/// Accounts required to update the VRF configuration.
-///
-/// Only the current `admin` may invoke this instruction.
+/// Accounts required to update the coordinator configuration.
 #[derive(Accounts)]
 pub struct UpdateConfig<'info> {
     /// Current admin; must sign.
     pub admin: Signer<'info>,
 
-    /// VRF configuration PDA to update.
+    /// Coordinator configuration PDA to update.
     #[account(
         mut,
-        seeds = [b"vrf-config"],
+        seeds = [b"coordinator-config"],
         bump = config.bump,
         constraint = config.admin == admin.key() @ VrfError::Unauthorized,
     )]
-    pub config: Account<'info, VrfConfiguration>,
+    pub config: Account<'info, CoordinatorConfig>,
 }
 
-/// Update one or more VRF configuration fields.
-///
-/// Each parameter is optional — only `Some` values are applied. Zero-address
-/// values are rejected for `authority`, `treasury`, and `admin` to prevent
-/// accidental lockout.
+/// Update one or more coordinator configuration fields.
 pub fn handler(
     ctx: Context<UpdateConfig>,
     new_authority: Option<Pubkey>,
-    new_fee: Option<u64>,
-    new_treasury: Option<Pubkey>,
+    new_fee_per_word: Option<u64>,
+    new_max_num_words: Option<u32>,
     new_admin: Option<Pubkey>,
 ) -> Result<()> {
     let config = &mut ctx.accounts.config;
@@ -42,15 +36,11 @@ pub fn handler(
         );
         config.authority = authority;
     }
-    if let Some(fee) = new_fee {
-        config.fee = fee;
+    if let Some(fee) = new_fee_per_word {
+        config.fee_per_word = fee;
     }
-    if let Some(treasury) = new_treasury {
-        require!(
-            treasury != Pubkey::default(),
-            VrfError::ZeroAddressNotAllowed
-        );
-        config.treasury = treasury;
+    if let Some(max_words) = new_max_num_words {
+        config.max_num_words = max_words;
     }
     if let Some(admin) = new_admin {
         require!(
