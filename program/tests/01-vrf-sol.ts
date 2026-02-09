@@ -11,6 +11,7 @@ import {
   Transaction,
 } from "@solana/web3.js";
 import fs from "fs";
+import * as testKeys from "./keys/load";
 
 describe("vrf-sol", () => {
   const provider = anchor.AnchorProvider.env();
@@ -24,7 +25,7 @@ describe("vrf-sol", () => {
     fs.readFileSync("../backend/vrf-signer.json", "utf-8")
   );
   const authority = Keypair.fromSecretKey(Uint8Array.from(authoritySecret));
-  const treasury = Keypair.generate();
+  const treasury = testKeys.treasury;
 
   const fee = new anchor.BN(10_000); // 10,000 lamports
 
@@ -102,7 +103,7 @@ describe("vrf-sol", () => {
         .signers([authority])
         .rpc();
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       if (
         errStr.includes("RequestNotPending") ||
         errStr.includes("Unknown action") ||
@@ -136,6 +137,11 @@ describe("vrf-sol", () => {
     // Fund treasury so it can receive fee transfers (needs rent-exempt minimum)
     await fundAccount(treasury.publicKey, LAMPORTS_PER_SOL);
 
+    // Fund all fixed test keypairs (for negative test cases)
+    await fundAccount(testKeys.wrongAuthority.publicKey, LAMPORTS_PER_SOL);
+    await fundAccount(testKeys.wrongPlayer.publicKey, LAMPORTS_PER_SOL);
+    await fundAccount(testKeys.nonAdmin.publicKey, LAMPORTS_PER_SOL);
+
     // Check if config already exists (from a prior test run)
     const existingConfig = await provider.connection.getAccountInfo(configPda);
     if (existingConfig) {
@@ -149,6 +155,11 @@ describe("vrf-sol", () => {
         })
         .rpc();
     }
+  });
+
+  // Delay between tests to respect Helius devnet rate limits (50 req/s)
+  beforeEach(async () => {
+    await new Promise((r) => setTimeout(r, 1000));
   });
 
   // Test 1: Initialize - happy path (or verify after update on re-run)
@@ -262,7 +273,7 @@ describe("vrf-sol", () => {
         .signers([authority])
         .rpc();
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       if (
         errStr.includes("RequestNotPending") ||
         errStr.includes("Unknown action") ||
@@ -285,8 +296,7 @@ describe("vrf-sol", () => {
     // Create a new pending request for this test
     const reqId = await createRequest(0x04);
 
-    const wrongAuthority = Keypair.generate();
-    await fundAccount(wrongAuthority.publicKey, LAMPORTS_PER_SOL);
+    const wrongAuthority = testKeys.wrongAuthority;
 
     const requestId = new anchor.BN(reqId);
     const randomness = Buffer.alloc(32, 99);
@@ -314,7 +324,7 @@ describe("vrf-sol", () => {
         .rpc();
       expect.fail("Should have failed with wrong authority");
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       // Unauthorized (wrong authority rejected) or RequestNotPending (backend fulfilled first)
       expect(
         errStr.includes("Unauthorized") ||
@@ -376,8 +386,7 @@ describe("vrf-sol", () => {
     await fulfillRequest(pendingRequestId, 77);
     fulfilledRequestId = pendingRequestId;
 
-    const wrongRequester = Keypair.generate();
-    await fundAccount(wrongRequester.publicKey, LAMPORTS_PER_SOL);
+    const wrongRequester = testKeys.wrongPlayer;
 
     try {
       await program.methods
@@ -432,8 +441,8 @@ describe("vrf-sol", () => {
 
   // Test 10: Update config - admin only
   it("Updates config as admin", async () => {
-    const newAuthority = Keypair.generate();
-    const newTreasury = Keypair.generate();
+    const newAuthority = testKeys.newAuthority;
+    const newTreasury = testKeys.newTreasury;
     const newFee = new anchor.BN(20_000);
 
     await program.methods
@@ -509,7 +518,7 @@ describe("vrf-sol", () => {
         .rpc();
       expect.fail("Should have failed - request already fulfilled");
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       expect(
         errStr.includes("RequestNotPending") ||
         errStr.includes('"Custom":6000') ||
@@ -558,8 +567,7 @@ describe("vrf-sol", () => {
 
   // Test 15: Update config with non-admin → Unauthorized
   it("Fails to update config with non-admin", async () => {
-    const nonAdmin = Keypair.generate();
-    await fundAccount(nonAdmin.publicKey, LAMPORTS_PER_SOL);
+    const nonAdmin = testKeys.nonAdmin;
 
     try {
       await program.methods
@@ -641,7 +649,7 @@ describe("vrf-sol", () => {
         .rpc();
       expect.fail("Should have failed - wrong message");
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       // InvalidEd25519Message (message mismatch) or RequestNotPending (backend fulfilled first)
       expect(
         errStr.includes("InvalidEd25519Message") ||
@@ -680,8 +688,7 @@ describe("vrf-sol", () => {
       })
       .rpc();
 
-    const wrongRequester = Keypair.generate();
-    await fundAccount(wrongRequester.publicKey, LAMPORTS_PER_SOL);
+    const wrongRequester = testKeys.wrongPlayer;
 
     try {
       await program.methods
@@ -795,7 +802,7 @@ describe("vrf-sol", () => {
         .signers([authority])
         .rpc({ commitment: "confirmed" });
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       if (
         !errStr.includes("RequestNotPending") &&
         !errStr.includes("Unknown action") &&
@@ -833,7 +840,7 @@ describe("vrf-sol", () => {
         })
         .rpc({ commitment: "confirmed" });
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       if (
         errStr.includes("Unknown action") ||
         errStr.includes("RequestNotFulfilled") ||
@@ -867,7 +874,7 @@ describe("vrf-sol", () => {
         })
         .rpc({ commitment: "confirmed" });
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+      const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
       if (
         errStr.includes("Unknown action") ||
         errStr.includes("RequestNotConsumed") ||

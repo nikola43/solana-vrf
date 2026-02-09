@@ -6,6 +6,9 @@
 //! - **Listener** — WebSocket subscription to on-chain events + startup catch-up scan.
 //! - **Fulfiller** — Consumes request events and submits fulfillment transactions.
 //! - **HTTP server** — Liveness (`/health`), readiness (`/status`), and `/metrics` probes.
+//!
+//! Supports both regular (PDA) and ZK Compressed (Light Protocol) requests
+//! when `PHOTON_RPC_URL` is configured.
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 use solana_sdk::signature::Signer;
@@ -19,10 +22,12 @@ mod config;
 mod fulfiller;
 mod listener;
 mod metrics;
+mod photon;
 mod vrf;
 
 use config::AppConfig;
 use metrics::Metrics;
+use photon::PhotonClient;
 
 /// Shared application state accessible from HTTP handlers.
 struct AppState {
@@ -87,12 +92,27 @@ async fn main() -> std::io::Result<()> {
         "Backend configuration"
     );
 
+    // Initialize optional Photon client for compressed request support
+    let photon: Option<Arc<PhotonClient>> = config.photon_rpc_url.as_ref().map(|url| {
+        info!(photon_url = %url, "Photon indexer configured — compressed requests enabled");
+        Arc::new(PhotonClient::new(url))
+    });
+
+    if photon.is_none() {
+        info!("PHOTON_RPC_URL not set — compressed request support disabled");
+    }
+
     let pending_count = Arc::new(AtomicU64::new(0));
     let metrics = Arc::new(Metrics::new());
     let (tx, rx) = mpsc::channel(256);
 
-    // Scan for any requests that arrived while the backend was offline.
+    // Scan for any regular requests that arrived while the backend was offline.
     listener::catch_up_pending_requests(&config, &tx, &metrics).await;
+
+    // Scan for any compressed requests that arrived while the backend was offline.
+    if let Some(ref photon_client) = photon {
+        listener::catch_up_compressed_requests(&config, photon_client, &tx, &metrics).await;
+    }
 
     // Background: stream on-chain events and forward to the fulfiller.
     let listener_config = config.clone();
@@ -106,8 +126,16 @@ async fn main() -> std::io::Result<()> {
     let fulfiller_config = config.clone();
     let fulfiller_pending = pending_count.clone();
     let fulfiller_metrics = metrics.clone();
+    let fulfiller_photon = photon.clone();
     let fulfiller_handle = tokio::spawn(async move {
-        fulfiller::run_fulfiller(fulfiller_config, rx, fulfiller_pending, fulfiller_metrics).await;
+        fulfiller::run_fulfiller(
+            fulfiller_config,
+            rx,
+            fulfiller_pending,
+            fulfiller_metrics,
+            fulfiller_photon,
+        )
+        .await;
     });
 
     let state = web::Data::new(AppState {

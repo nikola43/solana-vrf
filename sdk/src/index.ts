@@ -40,3 +40,20 @@ export { MoiraeVrf } from "./client";
 
 /** @deprecated Use `MoiraeVrf` instead. */
 export { MoiraeVrf as SolanaVrf } from "./client";
+
+// ZK Compressed mode
+export {
+  LIGHT_SYSTEM_PROGRAM_ID,
+  ACCOUNT_COMPRESSION_PROGRAM_ID,
+  NOOP_PROGRAM_ID,
+  DEVNET_LOOKUP_TABLE,
+  CompressedRequestStatus,
+  COMPRESSED_REQUEST_DISCRIMINATOR,
+  fetchCompressedRequests,
+  waitForCompressedFulfillment,
+  decodeCompressedRandomnessRequest,
+  createRequestRandomnessCompressedInstruction,
+  type CompressedRandomnessRequest,
+  type CompressedRequestResult,
+  type CompressedRandomnessOptions,
+} from "./compressed";

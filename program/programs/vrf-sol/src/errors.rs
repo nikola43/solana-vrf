@@ -41,4 +41,7 @@ pub enum VrfError {
     /// The request counter would overflow u64 (practically unreachable).
     #[msg("Request counter overflow")]
     CounterOverflow,
+    /// The compressed account data passed by the client does not match on-chain expectations.
+    #[msg("Compressed account data mismatch")]
+    CompressedAccountMismatch,
 }

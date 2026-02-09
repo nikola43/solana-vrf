@@ -32,3 +32,15 @@ pub struct RequestClosed {
     pub request_id: u64,
     pub requester: Pubkey,
 }
+
+/// Emitted when a new compressed randomness request is created via ZK Compression.
+///
+/// The backend listens for this event (distinct discriminator from [`RandomnessRequested`])
+/// to trigger compressed fulfillment via the Photon indexer.
+#[event]
+pub struct CompressedRandomnessRequested {
+    pub request_id: u64,
+    pub requester: Pubkey,
+    pub seed: [u8; 32],
+    pub request_slot: u64,
+}

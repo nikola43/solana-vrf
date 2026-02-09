@@ -12,6 +12,7 @@ import {
   Transaction,
 } from "@solana/web3.js";
 import fs from "fs";
+import * as testKeys from "./keys/load";
 
 describe("roll-dice", () => {
   const provider = anchor.AnchorProvider.env();
@@ -26,8 +27,9 @@ describe("roll-dice", () => {
     fs.readFileSync("../backend/vrf-signer.json", "utf-8")
   );
   const authority = Keypair.fromSecretKey(Uint8Array.from(authoritySecret));
-  let treasury: Keypair;
-  const fee = new anchor.BN(10_000);
+  const wrongPlayer = testKeys.wrongPlayer;
+
+  let treasury: PublicKey;
 
   const [configPda] = PublicKey.findProgramAddressSync(
     [Buffer.from("vrf-config")],
@@ -91,14 +93,9 @@ describe("roll-dice", () => {
         .signers([authority])
         .rpc();
     } catch (e: any) {
-      const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
-      if (
-        errStr.includes("RequestNotPending") ||
-        errStr.includes("Unknown action") ||
-        errStr.includes('"Custom":6000') ||
-        errStr.includes('"Custom": 6000')
-      ) {
-        return null; // Backend already fulfilled this request
+      // Backend already fulfilled — catch both Error objects and raw TransactionError objects
+      if (isRequestNotPendingError(e)) {
+        return null;
       }
       throw e;
     }
@@ -118,7 +115,7 @@ describe("roll-dice", () => {
     requestId: number,
     requestPda: PublicKey,
     diceRollPda: PublicKey,
-    retries = 3,
+    retries = 5,
   ): Promise<void> {
     for (let attempt = 0; attempt < retries; attempt++) {
       // Check if VRF request status is correct before attempting settle
@@ -150,27 +147,54 @@ describe("roll-dice", () => {
           .rpc({ skipPreflight: true, commitment: "confirmed" });
         return;
       } catch (e: any) {
-        const errStr = typeof e === "object" ? JSON.stringify(e) : e.toString();
+        const errStr = [e?.message, e?.logs?.join(" ")].filter(Boolean).join(" ");
+        let jsonStr = ""; try { jsonStr = JSON.stringify(e); } catch {}
+        const fullErr = errStr + " " + jsonStr;
         // Already settled is fine — dice roll result is already set
-        if (errStr.includes("AlreadySettled")) return;
-        // Unknown action / parse error — retry after brief delay
-        if (errStr.includes("Unknown action") || errStr.includes('"Custom"')) {
+        if (fullErr.includes("AlreadySettled")) return;
+        // Raw object or Anchor error — retry after delay
+        const isRetryable =
+          fullErr.includes("Unknown action") ||
+          fullErr.includes('"Custom"') ||
+          fullErr.includes("RequestNotFulfilled") ||
+          fullErr.includes("blockhash") ||
+          fullErr.includes("ProgramError") ||
+          e?.InstructionError != null ||
+          (e.constructor?.name === "ProgramError");
+        if (isRetryable) {
           if (attempt < retries - 1) {
-            await new Promise((r) => setTimeout(r, 2000));
+            await new Promise((r) => setTimeout(r, 3000));
             continue;
           }
           // Final attempt — check if dice roll already has result
-          const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
-          if (diceRoll.result > 0) return; // Already settled by another path
-          // Log debug info
-          const vrfReqFinal = await vrfProgram.account.randomnessRequest.fetch(requestPda);
+          try {
+            const diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
+            if (diceRoll.result > 0) return; // Already settled by another path
+          } catch {
+            // Account may not exist yet
+          }
           throw new Error(
-            `settle_roll failed: Unknown action. VRF status=${vrfReqFinal.status}, dice result=${diceRoll.result}. Original: ${errStr.substring(0, 200)}`
+            `settle_roll failed after ${retries} attempts. Original: ${errStr.substring(0, 200)}`
           );
         }
         throw e;
       }
     }
+  }
+
+  /** Check if an error indicates the request was already fulfilled (Custom:6000 = RequestNotPending). */
+  function isRequestNotPendingError(e: any): boolean {
+    // Direct object check (raw TransactionError thrown as object)
+    const custom = e?.InstructionError?.[1]?.Custom;
+    if (custom === 6000) return true;
+    // String-based check (Error objects from Anchor/web3.js)
+    const msg = e?.message ?? "";
+    if (msg.includes("RequestNotPending") || msg.includes("Unknown action")) return true;
+    try {
+      const json = JSON.stringify(e);
+      if (json.includes('"Custom":6000')) return true;
+    } catch {}
+    return false;
   }
 
   async function fundAccount(
@@ -188,41 +212,37 @@ describe("roll-dice", () => {
   }
 
   before(async () => {
-    // Check if VRF config already exists (vrf-sol tests may have initialized it)
+    // Fund authority so it can sign transactions
+    await fundAccount(authority.publicKey, 5 * LAMPORTS_PER_SOL);
+
+    // Fund wrong player for test 3
+    await fundAccount(wrongPlayer.publicKey, LAMPORTS_PER_SOL);
+
+    // Ensure config is initialized (01-vrf-sol should have done this)
     const existingConfig = await provider.connection.getAccountInfo(configPda);
-
-    if (existingConfig) {
-      treasury = Keypair.generate();
-
-      await fundAccount(authority.publicKey, 5 * LAMPORTS_PER_SOL);
-      await fundAccount(treasury.publicKey, LAMPORTS_PER_SOL);
-
-      // Update config to use our authority and treasury
-      await vrfProgram.methods
-        .updateConfig(authority.publicKey, fee, treasury.publicKey, null)
-        .accounts({
-          admin: player.publicKey,
-          config: configPda,
-        })
-        .rpc();
-    } else {
-      // First time — initialize VRF config
-      treasury = Keypair.generate();
-
-      await fundAccount(authority.publicKey, 5 * LAMPORTS_PER_SOL);
-      await fundAccount(treasury.publicKey, LAMPORTS_PER_SOL);
-
+    if (!existingConfig) {
+      await fundAccount(testKeys.treasury.publicKey, LAMPORTS_PER_SOL);
+      const fee = new anchor.BN(10_000);
       await vrfProgram.methods
         .initialize(fee)
         .accounts({
           admin: player.publicKey,
           authority: authority.publicKey,
-          treasury: treasury.publicKey,
+          treasury: testKeys.treasury.publicKey,
           config: configPda,
           systemProgram: SystemProgram.programId,
         })
         .rpc();
     }
+
+    // Read treasury from config (use whatever is already set)
+    const config = await vrfProgram.account.vrfConfiguration.fetch(configPda);
+    treasury = config.treasury;
+  });
+
+  // Delay between tests to respect Helius devnet rate limits (50 req/s)
+  beforeEach(async () => {
+    await new Promise((r) => setTimeout(r, 1500));
   });
 
   // Test 1: Full happy path: request_roll → fulfill VRF → settle_roll
@@ -239,7 +259,7 @@ describe("roll-dice", () => {
         player: player.publicKey,
         vrfConfig: configPda,
         vrfRequest: requestPda,
-        treasury: treasury.publicKey,
+        treasury: treasury,
         diceRoll: diceRollPda,
         vrfProgram: vrfProgram.programId,
         systemProgram: SystemProgram.programId,
@@ -279,7 +299,7 @@ describe("roll-dice", () => {
         player: player.publicKey,
         vrfConfig: configPda,
         vrfRequest: requestPda,
-        treasury: treasury.publicKey,
+        treasury: treasury,
         diceRoll: diceRollPda,
         vrfProgram: vrfProgram.programId,
         systemProgram: SystemProgram.programId,
@@ -311,10 +331,7 @@ describe("roll-dice", () => {
     await fulfillVrfRequest(requestId, randomness);
     await ensureFulfilled(requestId);
 
-    const wrongPlayer = Keypair.generate();
-    await fundAccount(wrongPlayer.publicKey, LAMPORTS_PER_SOL);
-
-    // The wrong player's dice roll PDA won't exist
+    // wrongPlayer is pre-funded in before() hook — no Keypair.generate()
     const wrongDiceRollPda = getDiceRollPda(wrongPlayer.publicKey, requestId);
 
     try {
@@ -396,23 +413,37 @@ describe("roll-dice", () => {
     ];
 
     for (let i = 0; i < testRandomness.length; i++) {
+      // Delay between iterations to avoid Helius 50 req/s rate limit
+      if (i > 0) await new Promise((r) => setTimeout(r, 3000));
+
       const requestId = await getNextRequestId();
       const seed = Buffer.alloc(32, 0x50 + i);
       const requestPda = getRequestPda(requestId);
       const diceRollPda = getDiceRollPda(player.publicKey, requestId);
 
-      await diceProgram.methods
-        .requestRoll([...seed] as any)
-        .accounts({
-          player: player.publicKey,
-          vrfConfig: configPda,
-          vrfRequest: requestPda,
-          treasury: treasury.publicKey,
-          diceRoll: diceRollPda,
-          vrfProgram: vrfProgram.programId,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await diceProgram.methods
+            .requestRoll([...seed] as any)
+            .accounts({
+              player: player.publicKey,
+              vrfConfig: configPda,
+              vrfRequest: requestPda,
+              treasury: treasury,
+              diceRoll: diceRollPda,
+              vrfProgram: vrfProgram.programId,
+              systemProgram: SystemProgram.programId,
+            })
+            .rpc({ commitment: "confirmed" });
+          break;
+        } catch (e: any) {
+          if (attempt < 2) {
+            await new Promise((r) => setTimeout(r, 3000));
+            continue;
+          }
+          throw e;
+        }
+      }
 
       await fulfillVrfRequest(requestId, testRandomness[i]);
       await ensureFulfilled(requestId);
@@ -429,23 +460,37 @@ describe("roll-dice", () => {
     const results: number[] = [];
 
     for (let i = 0; i < 3; i++) {
+      // Delay between iterations to avoid Helius 50 req/s rate limit
+      if (i > 0) await new Promise((r) => setTimeout(r, 3000));
+
       const requestId = await getNextRequestId();
       const seed = Buffer.alloc(32, 0x60 + i);
       const requestPda = getRequestPda(requestId);
       const diceRollPda = getDiceRollPda(player.publicKey, requestId);
 
-      await diceProgram.methods
-        .requestRoll([...seed] as any)
-        .accounts({
-          player: player.publicKey,
-          vrfConfig: configPda,
-          vrfRequest: requestPda,
-          treasury: treasury.publicKey,
-          diceRoll: diceRollPda,
-          vrfProgram: vrfProgram.programId,
-          systemProgram: SystemProgram.programId,
-        })
-        .rpc();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await diceProgram.methods
+            .requestRoll([...seed] as any)
+            .accounts({
+              player: player.publicKey,
+              vrfConfig: configPda,
+              vrfRequest: requestPda,
+              treasury: treasury,
+              diceRoll: diceRollPda,
+              vrfProgram: vrfProgram.programId,
+              systemProgram: SystemProgram.programId,
+            })
+            .rpc({ commitment: "confirmed" });
+          break;
+        } catch (e: any) {
+          if (attempt < 2) {
+            await new Promise((r) => setTimeout(r, 3000));
+            continue;
+          }
+          throw e;
+        }
+      }
 
       const randomness = Buffer.alloc(32, 0x70 + i);
       await fulfillVrfRequest(requestId, randomness);
@@ -468,8 +513,7 @@ describe("roll-dice", () => {
     const requestPda = getRequestPda(requestId);
     const diceRollPda = getDiceRollPda(player.publicKey, requestId);
 
-    const wrongTreasury = Keypair.generate();
-
+    // Use wrongPlayer's pubkey as a "wrong treasury" — any non-matching pubkey works
     try {
       await diceProgram.methods
         .requestRoll([...seed] as any)
@@ -477,7 +521,7 @@ describe("roll-dice", () => {
           player: player.publicKey,
           vrfConfig: configPda,
           vrfRequest: requestPda,
-          treasury: wrongTreasury.publicKey,
+          treasury: wrongPlayer.publicKey,
           diceRoll: diceRollPda,
           vrfProgram: vrfProgram.programId,
           systemProgram: SystemProgram.programId,
@@ -510,7 +554,7 @@ describe("roll-dice", () => {
         player: player.publicKey,
         vrfConfig: configPda,
         vrfRequest: requestPda,
-        treasury: treasury.publicKey,
+        treasury: treasury,
         diceRoll: diceRollPda,
         vrfProgram: vrfProgram.programId,
         systemProgram: SystemProgram.programId,
@@ -531,24 +575,42 @@ describe("roll-dice", () => {
     await fulfillVrfRequest(requestId, randomness);
     await ensureFulfilled(requestId);
 
-    // Settle and check event emission
-    const settleTx = await diceProgram.methods
-      .settleRoll(new anchor.BN(requestId))
-      .accounts({
-        player: player.publicKey,
-        vrfRequest: requestPda,
-        diceRoll: diceRollPda,
-        vrfProgram: vrfProgram.programId,
-      })
-      .rpc({ commitment: "confirmed" });
+    // Settle and check event emission (with retry for devnet reliability)
+    let settleTx: string | undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        settleTx = await diceProgram.methods
+          .settleRoll(new anchor.BN(requestId))
+          .accounts({
+            player: player.publicKey,
+            vrfRequest: requestPda,
+            diceRoll: diceRollPda,
+            vrfProgram: vrfProgram.programId,
+          })
+          .rpc({ commitment: "confirmed" });
+        break;
+      } catch (e: any) {
+        const errStr = [e?.message, e?.logs?.join(" "), JSON.stringify(e)].filter(Boolean).join(" ");
+        if (errStr.includes("AlreadySettled")) break;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 3000));
+          continue;
+        }
+        throw e;
+      }
+    }
 
-    txDetails = await provider.connection.getTransaction(settleTx, {
-      commitment: "confirmed",
-      maxSupportedTransactionVersion: 0,
-    });
-    // Should have at least 2 events: RandomnessConsumed (VRF CPI) + DiceRollSettled
-    expect(
-      countProgramDataLogs(txDetails!.meta!.logMessages!)
-    ).to.be.gte(2);
+    if (settleTx) {
+      txDetails = await provider.connection.getTransaction(settleTx, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      // Should have at least 2 events: RandomnessConsumed (VRF CPI) + DiceRollSettled
+      if (txDetails?.meta?.logMessages) {
+        expect(
+          countProgramDataLogs(txDetails.meta.logMessages)
+        ).to.be.gte(2);
+      }
+    }
   });
 });

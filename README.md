@@ -71,14 +71,23 @@ See the [SDK README](sdk/README.md) for full API reference and the [examples/](e
 
 ## Comparison
 
-| Feature | Moirae | Switchboard | ORAO | MagicBlock |
-|---------|-----------|-------------|------|------------|
-| **Cost** | < 0.001 SOL | ~0.002 SOL | 0.001 SOL | 0.0005 SOL |
-| **Speed** | ~1-2 slots | ~2-3 slots | ~2-3 slots | ~1 slot |
-| **Verification** | Ed25519 sig | TEE attestation | Multi-sig | Rollup proof |
-| **Self-hostable** | Yes | No | No | Partial |
-| **SDK** | TypeScript | TypeScript + Rust | TypeScript + Rust | TypeScript |
+| Feature | Moirae | Moirae Compressed | Switchboard | ORAO |
+|---------|-----------|-------------------|-------------|------|
+| **Cost** | < 0.001 SOL | < 0.0005 SOL | ~0.002 SOL | 0.001 SOL |
+| **Rent locked** | ~0.0016 SOL | **0 SOL** | ~0.003 SOL | ~0.001 SOL |
+| **Lifecycle** | 4 steps | **2 steps** | 2 steps | 2 steps |
+| **Speed** | ~1-2 slots | ~1-2 slots | ~2-3 slots | ~2-3 slots |
+| **Verification** | Ed25519 sig | Ed25519 sig | TEE attestation | Multi-sig |
+| **Self-hostable** | Yes | Yes | No | No |
 | **Token required** | No | No | No | No |
+
+### Cost at Scale (1000 concurrent requests)
+
+| Mode | Rent Locked | Tx Fees | Total |
+|------|------------|---------|-------|
+| Regular | **1.61 SOL** | ~0.02 SOL | ~1.63 SOL |
+| Compressed (ZK) | **0 SOL** | ~0.06 SOL | ~0.06 SOL |
+| **Savings** | **1.61 SOL** | | **96% cheaper** |
 
 ## Architecture
 

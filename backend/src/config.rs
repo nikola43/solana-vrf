@@ -41,6 +41,9 @@ pub struct AppConfig {
     pub priority_fee_micro_lamports: u64,
     /// Maximum number of concurrent fulfillment tasks.
     pub fulfillment_concurrency: usize,
+    /// Optional Photon indexer RPC URL for ZK Compressed account support.
+    /// If set, the backend will also listen for and fulfill compressed requests.
+    pub photon_rpc_url: Option<String>,
 }
 
 impl AppConfig {
@@ -94,6 +97,8 @@ impl AppConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
 
+        let photon_rpc_url = std::env::var("PHOTON_RPC_URL").ok();
+
         Ok(Self {
             rpc_url,
             ws_url,
@@ -106,6 +111,7 @@ impl AppConfig {
             initial_retry_delay_ms,
             priority_fee_micro_lamports,
             fulfillment_concurrency,
+            photon_rpc_url,
         })
     }
 

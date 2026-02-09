@@ -9,6 +9,8 @@
 //! 2. **Live stream** ([`listen_for_events`]) — subscribes to program log
 //!    events via WebSocket, parses `RandomnessRequested` Anchor events in
 //!    real-time, and auto-reconnects with exponential backoff on disconnection.
+//!
+//! Also supports ZK Compressed requests via the Photon indexer when configured.
 
 use base64::Engine;
 use solana_account_decoder::UiAccountEncoding;
@@ -28,6 +30,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use crate::metrics::Metrics;
+use crate::photon::PhotonClient;
 use std::sync::Arc;
 
 /// Parsed representation of the on-chain `RandomnessRequested` Anchor event.
@@ -37,6 +40,23 @@ pub struct RandomnessRequestedEvent {
     pub requester: Pubkey,
     pub seed: [u8; 32],
     pub request_slot: u64,
+}
+
+/// A fulfillment request — either regular (PDA) or compressed (Light Protocol).
+#[derive(Debug, Clone)]
+pub enum FulfillmentRequest {
+    /// Regular request backed by an on-chain PDA.
+    Regular(RandomnessRequestedEvent),
+    /// Compressed request backed by a Light Protocol compressed account.
+    Compressed(CompressedFulfillmentRequest),
+}
+
+/// Data needed to fulfill a compressed randomness request.
+#[derive(Debug, Clone)]
+pub struct CompressedFulfillmentRequest {
+    pub event: RandomnessRequestedEvent,
+    /// Compressed account address.
+    pub address: [u8; 32],
 }
 
 /// Compute the Anchor event discriminator: `sha256("event:<Name>")[..8]`.
@@ -100,7 +120,7 @@ impl Deduplicator {
 /// Each found request is sent through the channel for fulfillment.
 pub async fn catch_up_pending_requests(
     config: &AppConfig,
-    tx: &mpsc::Sender<RandomnessRequestedEvent>,
+    tx: &mpsc::Sender<FulfillmentRequest>,
     metrics: &Arc<Metrics>,
 ) {
     info!("Scanning for pending requests");
@@ -158,11 +178,22 @@ pub async fn catch_up_pending_requests(
 
                 // Skip the 8-byte discriminator, then parse fixed-layout fields.
                 let body = &data[8..];
-                let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
-                let requester = Pubkey::try_from(&body[8..40]).unwrap();
+                let Ok(request_id_bytes) = body[0..8].try_into() else {
+                    warn!(account = %pubkey, "Failed to parse request_id, skipping");
+                    continue;
+                };
+                let request_id = u64::from_le_bytes(request_id_bytes);
+                let Ok(requester) = Pubkey::try_from(&body[8..40]) else {
+                    warn!(account = %pubkey, "Failed to parse requester pubkey, skipping");
+                    continue;
+                };
                 let mut seed = [0u8; 32];
                 seed.copy_from_slice(&body[40..72]);
-                let request_slot = u64::from_le_bytes(body[72..80].try_into().unwrap());
+                let Ok(slot_bytes) = body[72..80].try_into() else {
+                    warn!(account = %pubkey, "Failed to parse request_slot, skipping");
+                    continue;
+                };
+                let request_slot = u64::from_le_bytes(slot_bytes);
 
                 info!(
                     request_id,
@@ -179,7 +210,7 @@ pub async fn catch_up_pending_requests(
                     seed,
                     request_slot,
                 };
-                if tx.send(event).await.is_err() {
+                if tx.send(FulfillmentRequest::Regular(event)).await.is_err() {
                     error!("Channel closed while catching up pending requests");
                     return;
                 }
@@ -191,14 +222,54 @@ pub async fn catch_up_pending_requests(
     }
 }
 
+/// Scan for pending compressed requests via the Photon indexer.
+pub async fn catch_up_compressed_requests(
+    config: &AppConfig,
+    photon: &PhotonClient,
+    tx: &mpsc::Sender<FulfillmentRequest>,
+    metrics: &Arc<Metrics>,
+) {
+    info!("Scanning Photon for pending compressed requests");
+
+    match photon.find_pending_compressed_requests(&config.program_id).await {
+        Ok(accounts) => {
+            info!(count = accounts.len(), "Found pending compressed requests");
+            for account in accounts {
+                let event = RandomnessRequestedEvent {
+                    request_id: account.request.request_id,
+                    requester: account.request.requester,
+                    seed: account.request.seed,
+                    request_slot: account.request.request_slot,
+                };
+
+                metrics.record_compressed_request();
+
+                let req = FulfillmentRequest::Compressed(CompressedFulfillmentRequest {
+                    event,
+                    address: account.address,
+                });
+
+                if tx.send(req).await.is_err() {
+                    error!("Channel closed while catching up compressed requests");
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to fetch compressed accounts from Photon");
+        }
+    }
+}
+
 /// Subscribe to program logs via WebSocket and forward `RandomnessRequested`
 /// events to the fulfiller. Automatically reconnects with exponential backoff.
 pub async fn listen_for_events(
     config: AppConfig,
-    tx: mpsc::Sender<RandomnessRequestedEvent>,
+    tx: mpsc::Sender<FulfillmentRequest>,
     metrics: Arc<Metrics>,
 ) {
-    let discriminator = event_discriminator("RandomnessRequested");
+    let regular_discriminator = event_discriminator("RandomnessRequested");
+    let compressed_discriminator = event_discriminator("CompressedRandomnessRequested");
     let dedup = Deduplicator::new();
     let mut reconnect_delay = WS_RECONNECT_MIN;
 
@@ -223,7 +294,8 @@ pub async fn listen_for_events(
                         while let Some(log_result) = stream.next().await {
                             process_log_lines(
                                 &log_result.value.logs,
-                                &discriminator,
+                                &regular_discriminator,
+                                &compressed_discriminator,
                                 &tx,
                                 &dedup,
                                 &metrics,
@@ -249,16 +321,13 @@ pub async fn listen_for_events(
     }
 }
 
-/// Scan transaction log lines for `Program data:` entries that match the
-/// `RandomnessRequested` event discriminator.
-///
-/// Anchor emits events as base64-encoded `Program data:` log entries. Each
-/// entry is decoded, the first 8 bytes are compared against the expected
-/// discriminator, and matching entries are parsed into events.
+/// Scan transaction log lines for `Program data:` entries that match either
+/// `RandomnessRequested` or `CompressedRandomnessRequested` event discriminators.
 async fn process_log_lines(
     logs: &[String],
-    discriminator: &[u8; 8],
-    tx: &mpsc::Sender<RandomnessRequestedEvent>,
+    regular_discriminator: &[u8; 8],
+    compressed_discriminator: &[u8; 8],
+    tx: &mpsc::Sender<FulfillmentRequest>,
     dedup: &Deduplicator,
     metrics: &Arc<Metrics>,
 ) {
@@ -275,36 +344,74 @@ async fn process_log_lines(
             }
         };
 
-        if decoded.len() < 8 || decoded[..8] != *discriminator {
+        if decoded.len() < 8 {
             continue;
         }
 
-        let Some(event) = parse_randomness_requested_event(&decoded[8..]) else {
-            warn!("Failed to parse RandomnessRequested event payload");
-            continue;
-        };
+        let disc = &decoded[..8];
+        let payload = &decoded[8..];
 
-        // Deduplicate: skip if we've already dispatched this request_id
-        if !dedup.insert(event.request_id) {
-            debug!(
+        // Check if it's a regular request event
+        if disc == regular_discriminator {
+            let Some(event) = parse_randomness_requested_event(payload) else {
+                warn!("Failed to parse RandomnessRequested event payload");
+                continue;
+            };
+
+            if !dedup.insert(event.request_id) {
+                debug!(request_id = event.request_id, "Duplicate request, skipping");
+                continue;
+            }
+
+            metrics.record_request();
+
+            info!(
                 request_id = event.request_id,
-                "Duplicate request, skipping"
+                requester = %event.requester,
+                slot = event.request_slot,
+                "Received RandomnessRequested event"
             );
+
+            if tx.send(FulfillmentRequest::Regular(event)).await.is_err() {
+                error!("Channel closed, stopping listener");
+                return;
+            }
             continue;
         }
 
-        metrics.record_request();
+        // Check if it's a compressed request event
+        if disc == compressed_discriminator {
+            let Some(event) = parse_randomness_requested_event(payload) else {
+                warn!("Failed to parse CompressedRandomnessRequested event payload");
+                continue;
+            };
 
-        info!(
-            request_id = event.request_id,
-            requester = %event.requester,
-            slot = event.request_slot,
-            "Received RandomnessRequested event"
-        );
+            if !dedup.insert(event.request_id) {
+                debug!(request_id = event.request_id, "Duplicate compressed request, skipping");
+                continue;
+            }
 
-        if tx.send(event).await.is_err() {
-            error!("Channel closed, stopping listener");
-            return;
+            metrics.record_compressed_request();
+
+            info!(
+                request_id = event.request_id,
+                requester = %event.requester,
+                slot = event.request_slot,
+                compressed = true,
+                "Received CompressedRandomnessRequested event"
+            );
+
+            // For compressed requests, we don't have the address from the event alone.
+            // The fulfiller will query Photon to find the compressed account.
+            let req = FulfillmentRequest::Compressed(CompressedFulfillmentRequest {
+                event,
+                address: [0u8; 32], // Will be resolved by fulfiller via Photon
+            });
+
+            if tx.send(req).await.is_err() {
+                error!("Channel closed, stopping listener");
+                return;
+            }
         }
     }
 }

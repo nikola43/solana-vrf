@@ -225,3 +225,50 @@ See the `roll-dice` program at `program/programs/roll-dice/src/lib.rs` for a com
 | 121 | 32 | randomness ([u8; 32]) |
 | 153 | 8 | fulfilled_slot (u64 LE) |
 | 161 | 1 | bump (u8) |
+
+---
+
+## ZK Compressed Mode (Zero Rent)
+
+For high-volume use cases, Moirae supports ZK Compressed requests that eliminate rent costs entirely.
+
+### SDK Usage
+
+```typescript
+import { Connection, Keypair } from "@solana/web3.js";
+import { MoiraeVrf, waitForCompressedFulfillment } from "@moirae-vrf/sdk";
+
+const connection = new Connection("https://api.devnet.solana.com", "confirmed");
+const payer = Keypair.fromSecretKey(/* ... */);
+
+const vrf = new MoiraeVrf(connection);
+vrf.setPhotonRpcUrl("https://devnet.helius-rpc.com/?api-key=YOUR_KEY");
+
+// Wait for a compressed request to be fulfilled
+const result = await vrf.waitForCompressedFulfillment(requestId, {
+  timeout: 60_000,
+  interval: 3_000,
+});
+console.log("Randomness:", Buffer.from(result.randomness).toString("hex"));
+```
+
+### CompressedRandomnessRequest Layout (113 bytes, after discriminator)
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 8 | request_id (u64 LE) |
+| 8 | 32 | requester (Pubkey) |
+| 40 | 32 | seed ([u8; 32]) |
+| 72 | 8 | request_slot (u64 LE) |
+| 80 | 1 | status (u8): 0=Pending, 1=Fulfilled |
+| 81 | 32 | randomness ([u8; 32]) |
+
+### Backend Configuration
+
+Set `PHOTON_RPC_URL` in your `.env` to enable compressed request support:
+
+```env
+PHOTON_RPC_URL="https://devnet.helius-rpc.com/?api-key=YOUR_KEY"
+```
+
+The backend will automatically detect and fulfill both regular and compressed requests.

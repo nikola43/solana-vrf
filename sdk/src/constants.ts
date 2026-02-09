@@ -15,6 +15,8 @@ export const DISCRIMINATORS = {
   initialize: Buffer.from([175, 175, 109, 31, 13, 152, 155, 237]),
   updateConfig: Buffer.from([29, 158, 252, 191, 10, 83, 219, 99]),
   requestRandomnessWithCallback: Buffer.from([140, 11, 204, 125, 241, 255, 204, 233]),
+  requestRandomnessCompressed: Buffer.from([165, 191, 78, 118, 224, 244, 121, 83]),
+  fulfillRandomnessCompressed: Buffer.from([69, 6, 198, 148, 3, 22, 28, 21]),
 } as const;
 
 // Pre-computed Anchor account discriminators from IDL.

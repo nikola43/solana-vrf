@@ -136,6 +136,11 @@ describe("integration (live backend)", () => {
     expect(config.treasury.toBase58()).to.equal(AUTHORITY_PUBKEY.toBase58());
   });
 
+  // Delay between tests to respect Helius devnet rate limits (50 req/s)
+  beforeEach(async () => {
+    await new Promise((r) => setTimeout(r, 1000));
+  });
+
   it("Backend fulfills randomness request automatically", async () => {
     const requestId = await getNextRequestId();
     const seed = Buffer.alloc(32);

@@ -5,6 +5,12 @@ import {
   Transaction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import {
+  CompressedRandomnessRequest as CompressedRequest,
+  CompressedRandomnessOptions,
+  fetchCompressedRequests,
+  waitForCompressedFulfillment,
+} from "./compressed";
 import BN from "bn.js";
 import { randomBytes } from "crypto";
 import { VRF_PROGRAM_ID } from "./constants";
@@ -47,6 +53,7 @@ import {
 export class MoiraeVrf {
   public readonly connection: Connection;
   public readonly programId: PublicKey;
+  private photonRpcUrl?: string;
 
   constructor(
     connection: Connection,
@@ -54,6 +61,15 @@ export class MoiraeVrf {
   ) {
     this.connection = connection;
     this.programId = programId;
+  }
+
+  /**
+   * Set the Photon indexer RPC URL for compressed request support.
+   * Required for `getRandomnessCompressed` and related methods.
+   */
+  setPhotonRpcUrl(url: string): this {
+    this.photonRpcUrl = url;
+    return this;
   }
 
   /** Get the config PDA address. */
@@ -313,5 +329,46 @@ export class MoiraeVrf {
     });
 
     return { ...fulfilled, requestId, requestPda };
+  }
+
+  // ---------------------------------------------------------------------------
+  // ZK Compressed mode — zero-rent randomness via Light Protocol
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Fetch all compressed randomness requests from the Photon indexer.
+   *
+   * Requires `setPhotonRpcUrl()` to be called first.
+   */
+  async getCompressedRequests(): Promise<CompressedRequest[]> {
+    if (!this.photonRpcUrl) {
+      throw new Error(
+        "Photon RPC URL not set. Call setPhotonRpcUrl() first."
+      );
+    }
+    return fetchCompressedRequests(this.photonRpcUrl, this.programId);
+  }
+
+  /**
+   * Wait for a compressed randomness request to be fulfilled.
+   *
+   * Polls the Photon indexer until the request status changes to Fulfilled.
+   * Requires `setPhotonRpcUrl()` to be called first.
+   */
+  async waitForCompressedFulfillment(
+    requestId: BN | number | bigint,
+    opts?: { timeout?: number; interval?: number }
+  ): Promise<CompressedRequest> {
+    if (!this.photonRpcUrl) {
+      throw new Error(
+        "Photon RPC URL not set. Call setPhotonRpcUrl() first."
+      );
+    }
+    return waitForCompressedFulfillment(
+      this.photonRpcUrl,
+      requestId,
+      this.programId,
+      opts
+    );
   }
 }

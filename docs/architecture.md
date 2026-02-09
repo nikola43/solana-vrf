@@ -92,6 +92,53 @@ This means the oracle **cannot submit arbitrary randomness** — it must provide
                     └─────────┘
 ```
 
+## ZK Compressed Mode (Light Protocol)
+
+Moirae supports an alternative compressed mode that eliminates rent costs using Light Protocol's ZK Compression.
+
+### Compressed vs Regular
+
+| Aspect | Regular | Compressed |
+|--------|---------|------------|
+| **Rent** | ~0.0016 SOL per request (refunded on close) | 0 SOL |
+| **Lifecycle** | 4 steps: request → fulfill → consume → close | 2 steps: request → fulfill |
+| **Storage** | On-chain PDA | Off-chain Merkle tree (via Light Protocol) |
+| **Concurrent lock** | 1000 requests = 1.6 SOL locked | 1000 requests = 0 SOL locked |
+| **Complexity** | Simple PDA model | Requires Photon indexer for state queries |
+
+### Compressed Flow
+
+```
+  Requester                  VRF Program              Light System Program
+     │                          │                            │
+     │  request_compressed      │                            │
+     │─────────────────────────►│                            │
+     │  (seed, proof, address)  │       CPI: create          │
+     │                          │───────────────────────────►│
+     │                          │  ◄── compressed account ───│
+     │                          │                            │
+     │         CompressedRandomnessRequested event           │
+     │                          │                            │
+     │                    Oracle detects event                │
+     │                    Queries Photon for state            │
+     │                    Computes HMAC + Ed25519             │
+     │                          │                            │
+     │  fulfill_compressed      │                            │
+     │◄─────────────────────────│       CPI: update          │
+     │  (randomness, proof)     │───────────────────────────►│
+     │                          │  ◄── updated account ──────│
+     │                          │                            │
+     │         RandomnessFulfilled event                      │
+     │                                                       │
+     │  Query Photon for result  ─────────────────────────────
+```
+
+### Required Infrastructure
+
+- **Photon Indexer**: Helius provides a Photon indexer on devnet at `https://devnet.helius-rpc.com/?api-key=<key>`
+- **Light System Program**: `SySTEM1eSU2p4BGQfQpimFEWWSC1XDFeun3Nqzz3rT7` (deployed on devnet + mainnet)
+- **Account Compression Program**: `compr6CUsB5m2jS4Y3831ztGSTnDpnKJTKS95d64XVq`
+
 ## Trust Model
 
 | Party | Trust Assumption |

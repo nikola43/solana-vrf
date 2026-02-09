@@ -133,6 +133,33 @@ import {
 } from "@moirae-vrf/sdk";
 ```
 
+## ZK Compressed Mode (Zero Rent)
+
+For high-volume use cases, use compressed mode to eliminate rent costs entirely:
+
+```ts
+import { MoiraeVrf, fetchCompressedRequests } from "@moirae-vrf/sdk";
+
+const vrf = new MoiraeVrf(connection);
+vrf.setPhotonRpcUrl("https://devnet.helius-rpc.com/?api-key=YOUR_KEY");
+
+// Fetch all compressed requests
+const requests = await vrf.getCompressedRequests();
+
+// Wait for a compressed request to be fulfilled
+const result = await vrf.waitForCompressedFulfillment(requestId, {
+  timeout: 60_000,
+});
+console.log("Randomness:", Buffer.from(result.randomness).toString("hex"));
+```
+
+Compressed requests use Light Protocol's ZK Compression:
+- **Zero rent** — no SOL locked per request
+- **2-step lifecycle** — request → fulfill (no consume/close needed)
+- **Same security** — Ed25519 verification is identical to regular mode
+
+Requires `@lightprotocol/stateless.js` as an optional peer dependency for full transaction construction.
+
 ## Build
 
 ```bash
