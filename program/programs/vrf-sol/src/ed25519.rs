@@ -4,8 +4,8 @@ use solana_sdk_ids::ed25519_program;
 
 use crate::errors::VrfError;
 
-/// Introspect the Instructions sysvar to verify that instruction at index 0 is
-/// a valid Ed25519 signature verification with the expected authority and message.
+/// Introspect the Instructions sysvar to find and verify an Ed25519 signature
+/// verification instruction in the transaction.
 ///
 /// ## Ed25519 instruction data layout
 ///
@@ -28,13 +28,23 @@ pub fn verify_ed25519_instruction(
     request_id: u64,
     randomness: &[u8; 32],
 ) -> Result<()> {
-    let ix = sysvar_instructions::load_instruction_at_checked(
-        0,
-        &instructions_sysvar.to_account_info(),
-    )
-    .map_err(|_| VrfError::InvalidEd25519Instruction)?;
-
-    require_keys_eq!(ix.program_id, ed25519_program::ID, VrfError::InvalidEd25519Program);
+    // Scan up to 8 instructions to find the Ed25519 signature-verify instruction.
+    // This allows ComputeBudget instructions to precede the Ed25519 instruction.
+    let mut ix = None;
+    for idx in 0..8u16 {
+        match sysvar_instructions::load_instruction_at_checked(
+            idx as usize,
+            &instructions_sysvar.to_account_info(),
+        ) {
+            Ok(loaded_ix) if loaded_ix.program_id == ed25519_program::ID => {
+                ix = Some(loaded_ix);
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let ix = ix.ok_or(VrfError::InvalidEd25519Instruction)?;
 
     let data = &ix.data;
     require!(data.len() >= 16, VrfError::InvalidEd25519Instruction);

@@ -14,7 +14,7 @@ use crate::listener::RandomWordsRequestedEvent;
 /// The roll-dice `fulfill_random_words` instruction expects:
 /// 1. coordinator_config (signer) — provided automatically by the coordinator
 /// 2. game_config — PDA ["game-config"] from the dice program
-/// 3. dice_roll — PDA ["dice-roll", player, request_id_le_bytes] from the dice program
+/// 3. dice_roll — PDA ["dice-result", player, request_id_le_bytes] from the dice program
 pub fn derive_dice_callback_accounts(
     dice_program_id: &Pubkey,
     event: &RandomWordsRequestedEvent,
@@ -24,7 +24,7 @@ pub fn derive_dice_callback_accounts(
 
     let (dice_roll_pda, _) = Pubkey::find_program_address(
         &[
-            b"dice-roll",
+            b"dice-result",
             event.requester.as_ref(),
             &event.request_id.to_le_bytes(),
         ],

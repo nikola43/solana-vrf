@@ -151,10 +151,39 @@ pub async fn catch_up_pending_requests(
                     continue;
                 };
 
+                // Skip stale requests from old architecture (they parse as num_words=0)
+                if event.num_words == 0 {
+                    debug!(
+                        account = %pubkey,
+                        request_id = event.request_id,
+                        "Skipping request with num_words=0 (likely stale old-architecture account)"
+                    );
+                    continue;
+                }
+
+                // Verify the account PDA matches the expected derivation.
+                // Old-architecture accounts at ["request", id_le] will not match
+                // the new seed prefix ["vrf-request", id_le].
+                let (expected_pda, _) = Pubkey::find_program_address(
+                    &[b"vrf-request", &event.request_id.to_le_bytes()],
+                    &config.program_id,
+                );
+                if pubkey.to_string() != expected_pda.to_string() {
+                    debug!(
+                        account = %pubkey,
+                        expected = %expected_pda,
+                        request_id = event.request_id,
+                        "Skipping account with mismatched PDA (stale old-architecture request)"
+                    );
+                    continue;
+                }
+
                 info!(
                     request_id = event.request_id,
+                    subscription_id = event.subscription_id,
                     requester = %event.requester,
                     consumer = %event.consumer_program,
+                    num_words = event.num_words,
                     slot = event.request_slot,
                     "Queued pending request"
                 );
@@ -271,9 +300,11 @@ async fn process_log_lines(
 
             info!(
                 request_id = event.request_id,
+                subscription_id = event.subscription_id,
                 requester = %event.requester,
                 consumer = %event.consumer_program,
                 num_words = event.num_words,
+                callback_compute_limit = event.callback_compute_limit,
                 slot = event.request_slot,
                 "Received RandomWordsRequested event"
             );

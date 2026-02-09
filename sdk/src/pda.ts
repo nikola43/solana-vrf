@@ -50,7 +50,7 @@ export function getConsumerPda(
 
 /**
  * Derive a randomness request PDA from its ID.
- * Seeds: `["request", request_id.to_le_bytes()]`
+ * Seeds: `["vrf-request", request_id.to_le_bytes()]`
  */
 export function getRequestPda(
   requestId: BN | number | bigint,
@@ -59,7 +59,7 @@ export function getRequestPda(
   const id = new BN(requestId.toString());
   const idBuffer = id.toArrayLike(Buffer, "le", 8);
   return PublicKey.findProgramAddressSync(
-    [Buffer.from("request"), idBuffer],
+    [Buffer.from("vrf-request"), idBuffer],
     programId
   );
 }

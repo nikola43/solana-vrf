@@ -45,7 +45,7 @@ pub struct RequestRandomWords<'info> {
         init,
         payer = requester,
         space = 8 + RandomnessRequest::INIT_SPACE,
-        seeds = [b"request", config.request_counter.to_le_bytes().as_ref()],
+        seeds = [b"vrf-request", config.request_counter.to_le_bytes().as_ref()],
         bump,
     )]
     pub request: Account<'info, RandomnessRequest>,

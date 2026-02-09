@@ -31,6 +31,10 @@ use crate::vrf::compute_randomness;
 /// Known non-retryable Anchor error codes.
 const ERROR_REQUEST_NOT_PENDING: u32 = 6000;
 const ERROR_UNAUTHORIZED: u32 = 6007;
+/// Anchor framework error: AccountNotInitialized (already fulfilled and closed).
+const ERROR_ACCOUNT_NOT_INITIALIZED: u32 = 3012;
+/// Default compute unit limit for fulfillment + callback transactions.
+const DEFAULT_COMPUTE_UNIT_LIMIT: u32 = 400_000;
 
 /// Compute the Anchor instruction discriminator for `fulfill_random_words`.
 fn fulfill_discriminator() -> [u8; 8] {
@@ -48,6 +52,7 @@ fn is_non_retryable(err_str: &str) -> bool {
     let non_retryable_codes = [
         format!("0x{:x}", ERROR_REQUEST_NOT_PENDING),
         format!("0x{:x}", ERROR_UNAUTHORIZED),
+        format!("0x{:x}", ERROR_ACCOUNT_NOT_INITIALIZED),
     ];
     for code in &non_retryable_codes {
         if err_str.contains(code) {
@@ -58,6 +63,9 @@ fn is_non_retryable(err_str: &str) -> bool {
         || err_str.contains("Unauthorized")
         || err_str.contains("AccountNotInitialized")
         || err_str.contains("already in use")
+        || err_str.contains("InstructionFallbackNotFound")
+        || err_str.contains("AccountDiscriminatorMismatch")
+        || err_str.contains("AccountDiscriminatorNotFound")
 }
 
 /// Main fulfiller loop.
@@ -95,9 +103,11 @@ pub async fn run_fulfiller(
 
             info!(
                 request_id = event.request_id,
+                subscription_id = event.subscription_id,
                 requester = %event.requester,
                 consumer = %event.consumer_program,
                 num_words = event.num_words,
+                callback_compute_limit = event.callback_compute_limit,
                 slot = event.request_slot,
                 "Fulfilling randomness request"
             );
@@ -178,7 +188,10 @@ async fn fulfill_request(
         &callback_remaining,
     );
 
-    let mut instructions = Vec::with_capacity(3);
+    let mut instructions = Vec::with_capacity(4);
+    // Set compute unit limit to ensure enough CU for Ed25519 verify + fulfill + CPI callback
+    let compute_limit = event.callback_compute_limit.max(DEFAULT_COMPUTE_UNIT_LIMIT);
+    instructions.push(build_set_compute_unit_limit_instruction(compute_limit));
     if config.priority_fee_micro_lamports > 0 {
         instructions.push(build_set_compute_unit_price_instruction(
             config.priority_fee_micro_lamports,
@@ -274,6 +287,21 @@ fn build_ed25519_instruction(
     }
 }
 
+/// Build a `SetComputeUnitLimit` instruction.
+fn build_set_compute_unit_limit_instruction(units: u32) -> Instruction {
+    let compute_budget_id: Pubkey = "ComputeBudget111111111111111111111111111111"
+        .parse()
+        .unwrap();
+    let mut data = Vec::with_capacity(5);
+    data.push(2u8); // SetComputeUnitLimit instruction index
+    data.extend_from_slice(&units.to_le_bytes());
+    Instruction {
+        program_id: compute_budget_id,
+        accounts: vec![],
+        data,
+    }
+}
+
 /// Build a `SetComputeUnitPrice` instruction.
 fn build_set_compute_unit_price_instruction(micro_lamports: u64) -> Instruction {
     let compute_budget_id: Pubkey = "ComputeBudget111111111111111111111111111111"
@@ -299,7 +327,7 @@ fn build_fulfill_instruction(
 ) -> Instruction {
     let (config_pda, _) = Pubkey::find_program_address(&[b"coordinator-config"], program_id);
     let (request_pda, _) =
-        Pubkey::find_program_address(&[b"request", &event.request_id.to_le_bytes()], program_id);
+        Pubkey::find_program_address(&[b"vrf-request", &event.request_id.to_le_bytes()], program_id);
 
     // Instruction data: discriminator + request_id + randomness
     let mut data = Vec::with_capacity(8 + 8 + 32);

@@ -76,7 +76,7 @@ describe("integration (live backend)", () => {
   function getRequestPda(requestId: number | anchor.BN): PublicKey {
     const id = new anchor.BN(requestId);
     const [pda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("request"), id.toArrayLike(Buffer, "le", 8)],
+      [Buffer.from("vrf-request"), id.toArrayLike(Buffer, "le", 8)],
       vrfProgram.programId
     );
     return pda;
@@ -89,7 +89,7 @@ describe("integration (live backend)", () => {
     const id = new anchor.BN(requestId);
     const [pda] = PublicKey.findProgramAddressSync(
       [
-        Buffer.from("dice-roll"),
+        Buffer.from("dice-result"),
         playerKey.toBuffer(),
         id.toArrayLike(Buffer, "le", 8),
       ],
@@ -211,7 +211,7 @@ describe("integration (live backend)", () => {
   });
 
   beforeEach(async () => {
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 3000));
   });
 
   it("Backend fulfills dice roll request automatically via callback", async () => {
@@ -239,12 +239,14 @@ describe("integration (live backend)", () => {
       })
       .rpc();
 
-    // Verify dice roll is pending
+    // Verify dice roll exists (may already be settled by backend)
     let diceRoll = await diceProgram.account.diceRoll.fetch(diceRollPda);
-    expect(diceRoll.result).to.equal(0);
+    expect(diceRoll.result).to.be.gte(0).and.lte(6);
 
     // Wait for backend to fulfill + deliver callback (dice settled automatically)
-    const result = await pollDiceRollResult(diceRollPda);
+    const result = diceRoll.result > 0
+      ? diceRoll.result
+      : await pollDiceRollResult(diceRollPda);
     expect(result).to.be.gte(1).and.lte(6);
 
     // Verify request PDA was closed (rent refunded)

@@ -32,9 +32,11 @@ pub struct FulfillRandomWords<'info> {
     pub config: Account<'info, CoordinatorConfig>,
 
     /// The request PDA to fulfill. Must be in `Pending` status.
+    /// Closed after fulfillment; rent refunded to requester.
     #[account(
         mut,
-        seeds = [b"request", request_id.to_le_bytes().as_ref()],
+        close = requester,
+        seeds = [b"vrf-request", request_id.to_le_bytes().as_ref()],
         bump = request.bump,
         constraint = request.status == RandomnessRequest::STATUS_PENDING @ VrfError::RequestNotPending,
     )]
@@ -163,24 +165,8 @@ pub fn handler<'info>(
     invoke_signed(&callback_ix, &cpi_account_infos, &[signer_seeds])
         .map_err(|_| error!(VrfError::CallbackFailed))?;
 
-    // 5. Close request PDA, return rent to requester
-    let request_account_info = ctx.accounts.request.to_account_info();
-    let requester_account_info = ctx.accounts.requester.to_account_info();
-
-    // Transfer all lamports from request to requester
-    let request_lamports = request_account_info.lamports();
-    **request_account_info.try_borrow_mut_lamports()? = 0;
-    **requester_account_info.try_borrow_mut_lamports()? = requester_account_info
-        .lamports()
-        .checked_add(request_lamports)
-        .unwrap();
-
-    // Zero out account data to mark as closed
-    request_account_info.assign(&anchor_lang::solana_program::system_program::ID);
-    let mut data = request_account_info.try_borrow_mut_data()?;
-    for byte in data.iter_mut() {
-        *byte = 0;
-    }
+    // 5. Request PDA is closed automatically by Anchor's `close = requester` constraint.
+    //    Rent is refunded to the requester.
 
     // 6. Emit event
     emit!(RandomWordsFulfilled {

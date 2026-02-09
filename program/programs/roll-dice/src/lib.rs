@@ -20,7 +20,7 @@ pub struct GameConfig {
 
 /// A dice roll that is backed by VRF randomness.
 ///
-/// Seeds: `["dice-roll", player, request_id.to_le_bytes()]`
+/// Seeds: `["dice-result", player, request_id.to_le_bytes()]`
 ///
 /// The `result` field is `0` while the roll is pending (waiting for VRF
 /// fulfillment callback) and `1..=6` once settled.
@@ -226,12 +226,12 @@ pub struct RequestRoll<'info> {
     #[account(address = crate::ID)]
     pub this_program: UncheckedAccount<'info>,
 
-    /// Dice roll PDA. Seeds: `["dice-roll", player, counter.to_le_bytes()]`.
+    /// Dice roll PDA. Seeds: `["dice-result", player, counter.to_le_bytes()]`.
     #[account(
         init,
         payer = player,
         space = 8 + DiceRoll::INIT_SPACE,
-        seeds = [b"dice-roll", player.key().as_ref(), &vrf_config.request_counter.to_le_bytes()],
+        seeds = [b"dice-result", player.key().as_ref(), &vrf_config.request_counter.to_le_bytes()],
         bump,
     )]
     pub dice_roll: Account<'info, DiceRoll>,
@@ -260,7 +260,7 @@ pub struct FulfillRandomWords<'info> {
     /// The dice roll PDA to settle.
     #[account(
         mut,
-        seeds = [b"dice-roll", dice_roll.player.as_ref(), &request_id.to_le_bytes()],
+        seeds = [b"dice-result", dice_roll.player.as_ref(), &request_id.to_le_bytes()],
         bump = dice_roll.bump,
         constraint = dice_roll.vrf_request_id == request_id,
         constraint = dice_roll.result == 0 @ RollDiceError::AlreadySettled,
