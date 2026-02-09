@@ -66,13 +66,20 @@ pub struct ConsumerRegistration {
     pub bump: u8,
 }
 
+/// Maximum number of callback accounts that can be stored in a request.
+pub const MAX_CALLBACK_ACCOUNTS: usize = 4;
+
 /// Individual randomness request account, one per request.
 ///
-/// Seeds: `["request", request_id.to_le_bytes()]`
+/// Seeds: `["vrf-request", request_id.to_le_bytes()]`
 ///
 /// Lifecycle: Pending (0) -> Fulfilled+Callback (coordinator closes the account).
+///
+/// Callback accounts: When the consumer requests randomness, it may pass
+/// remaining_accounts that its callback instruction needs. These are stored
+/// in the request PDA so the backend oracle can read them and include them
+/// as remaining_accounts in the fulfillment transaction.
 #[account]
-#[derive(InitSpace)]
 pub struct RandomnessRequest {
     /// Unique identifier derived from `CoordinatorConfig::request_counter` at creation time.
     pub request_id: u64,
@@ -98,6 +105,12 @@ pub struct RandomnessRequest {
     pub fulfilled_slot: u64,
     /// PDA bump seed cached for efficient re-derivation.
     pub bump: u8,
+    /// Number of callback accounts stored (0 to MAX_CALLBACK_ACCOUNTS).
+    pub callback_account_count: u8,
+    /// Pubkeys of accounts the consumer's callback needs.
+    pub callback_account_keys: [Pubkey; MAX_CALLBACK_ACCOUNTS],
+    /// Bitmap: bit i = 1 means callback_account_keys[i] is writable.
+    pub callback_writable_bitmap: u8,
 }
 
 impl RandomnessRequest {
@@ -105,4 +118,9 @@ impl RandomnessRequest {
     pub const STATUS_PENDING: u8 = 0;
     /// Oracle has fulfilled and callback has been delivered.
     pub const STATUS_FULFILLED: u8 = 1;
+
+    /// Manually computed space (Anchor discriminator NOT included).
+    /// 8+8+32+32+4+32+8+4+1+32+8+1 + 1+128+1 = 300
+    pub const INIT_SPACE: usize = 8 + 8 + 32 + 32 + 4 + 32 + 8 + 4 + 1 + 32 + 8 + 1
+        + 1 + (32 * MAX_CALLBACK_ACCOUNTS) + 1;
 }

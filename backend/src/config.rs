@@ -24,8 +24,6 @@ pub struct AppConfig {
     pub hmac_secret: Vec<u8>,
     /// The deployed VRF coordinator program ID.
     pub program_id: Pubkey,
-    /// The roll-dice consumer program ID (for deriving callback accounts).
-    pub dice_program_id: Option<Pubkey>,
     /// Cluster name for explorer URLs.
     pub cluster: String,
     /// HTTP server port.
@@ -61,10 +59,6 @@ impl AppConfig {
         let program_id = Pubkey::from_str(&program_id_str)
             .with_context(|| format!("invalid PROGRAM_ID: {program_id_str}"))?;
 
-        let dice_program_id = std::env::var("DICE_PROGRAM_ID")
-            .ok()
-            .and_then(|s| Pubkey::from_str(&s).ok());
-
         let cluster =
             std::env::var("CLUSTER").unwrap_or_else(|_| "devnet".into());
 
@@ -99,7 +93,6 @@ impl AppConfig {
             authority_keypair: Arc::new(authority_keypair),
             hmac_secret,
             program_id,
-            dice_program_id,
             cluster,
             http_port,
             max_retries,

@@ -72,8 +72,11 @@ pub mod vrf_sol {
     }
 
     /// Request random words (called via CPI from a consumer program).
-    pub fn request_random_words(
-        ctx: Context<RequestRandomWords>,
+    ///
+    /// Remaining accounts are stored in the request PDA as callback accounts
+    /// so the oracle backend can include them when fulfilling.
+    pub fn request_random_words<'info>(
+        ctx: Context<'_, '_, '_, 'info, RequestRandomWords<'info>>,
         num_words: u32,
         seed: [u8; 32],
         callback_compute_limit: u32,

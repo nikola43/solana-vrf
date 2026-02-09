@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tracing::{error, info, instrument, warn};
 
 use crate::config::AppConfig;
-use crate::consumer_accounts::derive_callback_accounts;
+use crate::consumer_accounts::read_callback_accounts_from_request;
 use crate::listener::RandomWordsRequestedEvent;
 use crate::metrics::Metrics;
 use crate::vrf::compute_randomness;
@@ -33,6 +33,8 @@ const ERROR_REQUEST_NOT_PENDING: u32 = 6000;
 const ERROR_UNAUTHORIZED: u32 = 6007;
 /// Anchor framework error: AccountNotInitialized (already fulfilled and closed).
 const ERROR_ACCOUNT_NOT_INITIALIZED: u32 = 3012;
+/// Anchor framework error: AccountDidNotDeserialize (stale request from old program version).
+const ERROR_ACCOUNT_DID_NOT_DESERIALIZE: u32 = 3003;
 /// Default compute unit limit for fulfillment + callback transactions.
 const DEFAULT_COMPUTE_UNIT_LIMIT: u32 = 400_000;
 
@@ -53,6 +55,7 @@ fn is_non_retryable(err_str: &str) -> bool {
         format!("0x{:x}", ERROR_REQUEST_NOT_PENDING),
         format!("0x{:x}", ERROR_UNAUTHORIZED),
         format!("0x{:x}", ERROR_ACCOUNT_NOT_INITIALIZED),
+        format!("0x{:x}", ERROR_ACCOUNT_DID_NOT_DESERIALIZE),
     ];
     for code in &non_retryable_codes {
         if err_str.contains(code) {
@@ -66,6 +69,7 @@ fn is_non_retryable(err_str: &str) -> bool {
         || err_str.contains("InstructionFallbackNotFound")
         || err_str.contains("AccountDiscriminatorMismatch")
         || err_str.contains("AccountDiscriminatorNotFound")
+        || err_str.contains("AccountDidNotDeserialize")
 }
 
 /// Main fulfiller loop.
@@ -173,12 +177,17 @@ async fn fulfill_request(
 
     let ed25519_ix = build_ed25519_instruction(config.authority_keypair.as_ref(), &message);
 
-    // Derive consumer callback accounts
-    let callback_remaining = derive_callback_accounts(
-        &event.consumer_program,
-        config.dice_program_id.as_ref(),
-        event,
-    );
+    // Read consumer callback accounts from the request PDA on-chain.
+    let callback_remaining = read_callback_accounts_from_request(
+        rpc_client,
+        &config.program_id,
+        event.request_id,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        warn!(request_id = event.request_id, error = %e, "Failed to read callback accounts, using empty");
+        vec![]
+    });
 
     let fulfill_ix = build_fulfill_instruction(
         &config.program_id,

@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::errors::VrfError;
 use crate::events::RandomWordsRequested;
-use crate::state::{CoordinatorConfig, ConsumerRegistration, RandomnessRequest, Subscription};
+use crate::state::{CoordinatorConfig, ConsumerRegistration, RandomnessRequest, Subscription, MAX_CALLBACK_ACCOUNTS};
 
 /// Accounts required to request random words.
 ///
@@ -54,8 +54,13 @@ pub struct RequestRandomWords<'info> {
 }
 
 /// Request random words from the VRF oracle.
-pub fn handler(
-    ctx: Context<RequestRandomWords>,
+///
+/// Remaining accounts (if any) are stored in the request PDA as callback
+/// accounts. The backend oracle reads them and passes them as
+/// remaining_accounts when fulfilling, so the consumer's callback receives
+/// the accounts it needs.
+pub fn handler<'info>(
+    ctx: Context<'_, '_, '_, 'info, RequestRandomWords<'info>>,
     num_words: u32,
     seed: [u8; 32],
     callback_compute_limit: u32,
@@ -105,6 +110,21 @@ pub fn handler(
     request.randomness = [0u8; 32];
     request.fulfilled_slot = 0;
     request.bump = ctx.bumps.request;
+
+    // Store callback accounts from remaining_accounts (up to MAX_CALLBACK_ACCOUNTS).
+    let remaining = ctx.remaining_accounts;
+    let count = remaining.len().min(MAX_CALLBACK_ACCOUNTS);
+    request.callback_account_count = count as u8;
+    let mut keys = [Pubkey::default(); MAX_CALLBACK_ACCOUNTS];
+    let mut bitmap: u8 = 0;
+    for i in 0..count {
+        keys[i] = remaining[i].key();
+        if remaining[i].is_writable {
+            bitmap |= 1 << i;
+        }
+    }
+    request.callback_account_keys = keys;
+    request.callback_writable_bitmap = bitmap;
 
     config.request_counter = config
         .request_counter

@@ -70,7 +70,13 @@ const WS_RECONNECT_MAX: Duration = Duration::from_secs(60);
 ///
 /// Layout: discriminator (8) + request_id (8) + subscription_id (8) +
 /// consumer_program (32) + requester (32) + num_words (4) + seed (32) +
-/// request_slot (8) + callback_compute_limit (4) + status (1) = 137 bytes.
+/// request_slot (8) + callback_compute_limit (4) + status (1) +
+/// randomness (32) + fulfilled_slot (8) + bump (1) +
+/// callback_account_count (1) + callback_account_keys (128) +
+/// callback_writable_bitmap (1) = 308 bytes.
+///
+/// For backward compatibility with older requests that lack callback fields,
+/// we only require the first 137 bytes for parsing core fields.
 const MIN_ACCOUNT_DATA_LEN: usize = 137;
 
 /// Offset of the status byte in the RandomnessRequest account data.
