@@ -2,7 +2,7 @@
 
 ## System Overview
 
-Moirae is a verifiable randomness oracle that uses HMAC-SHA256 + Ed25519 signature proofs to deliver on-chain randomness.
+Moirae is a verifiable randomness oracle that uses HMAC-SHA256 + Ed25519 signature proofs to deliver on-chain randomness with automatic callback delivery.
 
 ```
                          Solana Blockchain
@@ -10,11 +10,11 @@ Moirae is a verifiable randomness oracle that uses HMAC-SHA256 + Ed25519 signatu
   │                                                          │
   │   ┌──────────────┐        CPI         ┌──────────────┐  │
   │   │   vrf-sol     │◄────────────────── │  Your Game   │  │
-  │   │              │                     │  Program     │  │
-  │   │  - request   │                     │              │  │
-  │   │  - fulfill   │                     │  - request   │  │
-  │   │  - consume   │                     │  - settle    │  │
-  │   │  - close     │                     │              │  │
+  │   │  coordinator  │ ──callback CPI──► │  Program     │  │
+  │   │              │                     │              │  │
+  │   │  - request   │                     │  - request   │  │
+  │   │  - fulfill   │                     │  - callback  │  │
+  │   │  + callback  │                     │              │  │
   │   └──────┬───────┘                     └──────────────┘  │
   │          │                                               │
   └──────────┼───────────────────────────────────────────────┘
@@ -46,16 +46,26 @@ output = HMAC-SHA256(secret, seed || request_slot || request_id)
 
 The output is **deterministic** (same inputs = same output) but **unpredictable** without knowledge of the HMAC secret.
 
+### Multi-Word Expansion
+
+For requests with `num_words > 1`, the base randomness is expanded:
+
+```
+word[i] = SHA256(base_randomness || i.to_le_bytes())
+```
+
+This produces `num_words` independent 32-byte random values from a single HMAC output.
+
 ## Ed25519 Verification Flow
 
 Each fulfillment transaction contains two instructions:
 
-1. **Native Ed25519 signature-verify** (instruction index 0)
+1. **Native Ed25519 signature-verify** (can be at any index; the program scans up to 8 instructions)
    - Proves the oracle signed `request_id (8 LE bytes) || randomness (32 bytes)` with its authority key
    - Uses the Solana runtime's built-in Ed25519 precompile
 
-2. **`fulfill_randomness`** (instruction index 1)
-   - Introspects the Instructions sysvar to verify instruction 0
+2. **`fulfill_random_words`** (the coordinator instruction)
+   - Introspects the Instructions sysvar to find the Ed25519 instruction
    - Checks: correct program, 1 signature, matching public key, matching message
    - All `*_instruction_index` offsets must be `0xFFFF` (self-referencing)
 
@@ -64,80 +74,45 @@ This means the oracle **cannot submit arbitrary randomness** — it must provide
 ## Request Lifecycle
 
 ```
-                    ┌─────────┐
-                    │ Request │  User calls request_randomness
-                    │ Pending │  with a 32-byte seed
-                    └────┬────┘
+                    ┌──────────┐
+                    │ Request  │  Consumer CPIs request_random_words
+                    │ Pending  │  with seed, num_words, callback_compute_limit
+                    └────┬─────┘
                          │
-              Oracle detects event via WS
+              Oracle detects event via WebSocket
               Computes HMAC-SHA256 output
-              Signs with Ed25519
+              Signs request_id || randomness with Ed25519
                          │
-                    ┌────▼────┐
-                    │ Fulfill │  Oracle submits Ed25519 proof +
-                    │ Filled  │  fulfill_randomness instruction
-                    └────┬────┘
-                         │
-              Requester reads randomness
-              and calls consume_randomness
-                         │
-                    ┌────▼────┐
-                    │Consumed │  Prevents double-consumption
-                    └────┬────┘
-                         │
-              Requester calls close_request
-                         │
-                    ┌────▼────┐
-                    │ Closed  │  Account deleted, rent reclaimed
-                    └─────────┘
+                    ┌────▼─────┐
+                    │ Fulfill  │  Oracle submits Ed25519 proof +
+                    │          │  fulfill_random_words instruction
+                    │          │  Coordinator:
+                    │          │    1. Verifies Ed25519 proof
+                    │          │    2. Expands randomness into num_words
+                    │          │    3. CPIs fulfill_random_words into consumer
+                    │          │    4. Closes request PDA (rent → requester)
+                    └──────────┘
 ```
 
-## ZK Compressed Mode (Light Protocol)
+The entire fulfill + callback + cleanup happens in a single transaction. No separate consume or close steps are needed.
 
-Moirae supports an alternative compressed mode that eliminates rent costs using Light Protocol's ZK Compression.
+## Subscription Model
 
-### Compressed vs Regular
+Moirae uses a subscription-based billing model similar to Chainlink VRF v2:
 
-| Aspect | Regular | Compressed |
-|--------|---------|------------|
-| **Rent** | ~0.0016 SOL per request (refunded on close) | 0 SOL |
-| **Lifecycle** | 4 steps: request → fulfill → consume → close | 2 steps: request → fulfill |
-| **Storage** | On-chain PDA | Off-chain Merkle tree (via Light Protocol) |
-| **Concurrent lock** | 1000 requests = 1.6 SOL locked | 1000 requests = 0 SOL locked |
-| **Complexity** | Simple PDA model | Requires Photon indexer for state queries |
+1. **Create subscription** — owner gets a subscription ID
+2. **Fund subscription** — deposit SOL to cover VRF fees
+3. **Register consumers** — authorize specific programs to use the subscription
+4. **Request randomness** — consumer CPIs request_random_words; fee deducted from subscription
+5. **Manage** — owner can remove consumers, cancel subscription (refund remaining balance)
 
-### Compressed Flow
+### Fee Calculation
 
 ```
-  Requester                  VRF Program              Light System Program
-     │                          │                            │
-     │  request_compressed      │                            │
-     │─────────────────────────►│                            │
-     │  (seed, proof, address)  │       CPI: create          │
-     │                          │───────────────────────────►│
-     │                          │  ◄── compressed account ───│
-     │                          │                            │
-     │         CompressedRandomnessRequested event           │
-     │                          │                            │
-     │                    Oracle detects event                │
-     │                    Queries Photon for state            │
-     │                    Computes HMAC + Ed25519             │
-     │                          │                            │
-     │  fulfill_compressed      │                            │
-     │◄─────────────────────────│       CPI: update          │
-     │  (randomness, proof)     │───────────────────────────►│
-     │                          │  ◄── updated account ──────│
-     │                          │                            │
-     │         RandomnessFulfilled event                      │
-     │                                                       │
-     │  Query Photon for result  ─────────────────────────────
+fee = fee_per_word × num_words
 ```
 
-### Required Infrastructure
-
-- **Photon Indexer**: Helius provides a Photon indexer on devnet at `https://devnet.helius-rpc.com/?api-key=<key>`
-- **Light System Program**: `SySTEM1eSU2p4BGQfQpimFEWWSC1XDFeun3Nqzz3rT7` (deployed on devnet + mainnet)
-- **Account Compression Program**: `compr6CUsB5m2jS4Y3831ztGSTnDpnKJTKS95d64XVq`
+The fee is deducted from the subscription balance at request time, before the oracle fulfills.
 
 ## Trust Model
 
@@ -152,12 +127,13 @@ Moirae supports an alternative compressed mode that eliminates rent costs using 
 ## Comparison with Other VRF Solutions
 
 | Feature | Moirae | Switchboard | ORAO | MagicBlock |
-|---------|-----------|-------------|------|------------|
+|---------|--------|-------------|------|------------|
 | **Approach** | HMAC + Ed25519 | TEE (Intel SGX) | Ed25519 multi-party | Ephemeral Rollups |
 | **Oracle model** | Single oracle | TEE-based | Multi-party (3+) | Single |
 | **Cost per request** | < 0.001 SOL | ~0.002 SOL | 0.001 SOL | 0.0005 SOL |
 | **Fulfillment time** | ~1-2 slots | ~2-3 slots | ~2-3 slots | ~1 slot |
-| **Callback support** | Planned | Yes | Yes | Yes |
+| **Callback support** | Yes (automatic CPI) | Yes | Yes | Yes |
+| **Subscription billing** | Yes | Yes | No | No |
 | **SDK** | TypeScript | TypeScript + Rust | TypeScript + Rust | TypeScript |
 | **Self-hostable** | Yes | No (TEE required) | No | Partial |
 | **On-chain verification** | Ed25519 sig proof | TEE attestation | Multi-sig threshold | Rollup proof |
@@ -174,18 +150,20 @@ Moirae supports an alternative compressed mode that eliminates rent costs using 
 The backend oracle runs three concurrent subsystems:
 
 ### Listener
-- Startup catch-up scan via `getProgramAccounts` (finds missed requests)
+- Startup catch-up scan via `getProgramAccounts` (finds missed requests by filtering status byte)
 - Live WebSocket subscription to program logs
 - Exponential backoff on disconnect (1s → 60s cap)
-- Request deduplication to prevent overlap between catch-up and live streams
+- Request deduplication via in-memory HashSet to prevent overlap between catch-up and live streams
 
 ### Fulfiller
 - Concurrent fulfillment with configurable semaphore (default: 4 concurrent)
-- Exponential backoff retry on `BlockhashNotFound` errors
+- Reads callback accounts (up to 4) from the request PDA's stored keys and writable bitmap
+- Exponential backoff retry on `BlockhashNotFound` errors (initial 500ms, doubles each attempt, max 60s)
+- Non-retryable error classification (RequestNotPending, Unauthorized, etc.) to skip stale requests
 - Optional priority fee for congested periods
 - Metrics recording (latency, success/fail counts)
 
 ### HTTP Server
-- `/health` — liveness probe
-- `/status` — readiness + pending count
-- `/metrics` — JSON counters for monitoring
+- `/health` — liveness probe (`{"status":"ok"}`)
+- `/status` — readiness + pending count (`{"status":"running","pending_fulfillments":N}`)
+- `/metrics` — JSON counters (requests received/fulfilled/failed, avg latency, pending)

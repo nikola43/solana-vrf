@@ -10,22 +10,27 @@ npm install @moirae-vrf/sdk @solana/web3.js
 
 ## Quick Start
 
-Get verifiable randomness in 3 lines:
-
 ```ts
 import { Connection, Keypair } from "@solana/web3.js";
 import { MoiraeVrf } from "@moirae-vrf/sdk";
+import BN from "bn.js";
 
 const connection = new Connection("https://api.devnet.solana.com", "confirmed");
 const payer = Keypair.fromSecretKey(/* your keypair */);
 const vrf = new MoiraeVrf(connection);
 
-// One call does everything: request → wait for oracle → consume → close
-const { randomness } = await vrf.getRandomness(payer);
-console.log("Random bytes:", Buffer.from(randomness).toString("hex"));
-```
+// Create and fund a subscription
+const { subscriptionId } = await vrf.createSubscription(payer);
+await vrf.fundSubscription(payer, subscriptionId, new BN(1_000_000_000));
 
-That's it. The `getRandomness` method handles the entire lifecycle automatically.
+// Register a consumer program
+await vrf.addConsumer(payer, subscriptionId, myConsumerProgramId);
+
+// Read coordinator config
+const config = await vrf.getConfig();
+console.log("Fee per word:", config.feePerWord.toString());
+console.log("Next request ID:", config.requestCounter.toString());
+```
 
 ## API Reference
 
@@ -35,52 +40,52 @@ That's it. The `getRandomness` method handles the entire lifecycle automatically
 const vrf = new MoiraeVrf(connection, programId?);
 ```
 
-#### Simple Methods (recommended)
+#### Subscription Management
 
 | Method | Description |
 |--------|-------------|
-| `getRandomness(payer, opts?)` | Get random bytes in one call. Handles request, wait, consume, and close automatically. |
-| `requestAndWait(payer, opts?)` | Request + wait for fulfillment. Does NOT consume/close (for on-chain programs that read the request account). |
+| `createSubscription(payer, priorityFee?)` | Create a new subscription. Returns `{ subscriptionId, subscriptionPda }` |
+| `fundSubscription(payer, subscriptionId, amount)` | Fund a subscription with SOL |
+| `addConsumer(owner, subscriptionId, consumerProgramId)` | Register a consumer program for a subscription |
+| `removeConsumer(owner, subscriptionId, consumerProgramId)` | Remove a consumer program from a subscription |
+| `cancelSubscription(owner, subscriptionId)` | Cancel subscription and reclaim balance (requires 0 consumers) |
 
-Options for both methods:
-
-```ts
-{
-  seed?: Uint8Array;      // 32-byte entropy (auto-generated if omitted)
-  priorityFee?: number;   // Micro-lamports per compute unit
-  timeout?: number;       // Max wait time in ms (default: 60000)
-  interval?: number;      // Polling interval in ms (default: 2000)
-}
-```
-
-#### Step-by-Step Methods (advanced)
+#### Account Fetchers
 
 | Method | Description |
 |--------|-------------|
-| `requestRandomness(payer, seed, priorityFee?)` | Submit a randomness request. Returns `{ requestId, requestPda }` |
-| `requestRandomnessWithCallback(payer, seed, callbackProgram, priorityFee?)` | Request with a callback program for automatic CPI |
-| `waitForFulfillment(requestId, opts?)` | Poll until fulfilled. Returns the request account with randomness |
-| `consumeRandomness(payer, requestId)` | Mark randomness as consumed |
-| `closeRequest(payer, requestId)` | Close request account and reclaim rent |
-
-#### Read Methods
-
-| Method | Description |
-|--------|-------------|
-| `getConfig()` | Fetch VRF configuration |
+| `getConfig()` | Fetch coordinator configuration |
+| `getSubscription(subscriptionId)` | Fetch a subscription account |
+| `getConsumerRegistration(subscriptionId, consumerProgramId)` | Fetch a consumer registration |
 | `getRequest(requestId)` | Fetch a specific request account |
-| `getNextRequestId()` | Get the next request ID from the config counter |
+| `getNextRequestId()` | Get the next request ID from config counter |
+| `getNextSubscriptionId()` | Get the next subscription ID from config counter |
+
+#### PDA Derivation
+
+| Method | Description |
+|--------|-------------|
 | `getConfigPda()` | Derive the config PDA address |
+| `getSubscriptionPda(subscriptionId)` | Derive a subscription PDA address |
+| `getConsumerPda(subscriptionId, consumerProgramId)` | Derive a consumer registration PDA address |
 | `getRequestPda(requestId)` | Derive a request PDA address |
+
+#### Fulfillment Monitoring
+
+| Method | Description |
+|--------|-------------|
+| `waitForFulfillment(requestId, opts?)` | Poll until fulfilled. May throw if PDA was already closed (expected in callback model) |
 
 ### Low-Level Instruction Builders
 
 ```ts
 import {
-  createRequestRandomnessInstruction,
-  createRequestRandomnessWithCallbackInstruction,
-  createConsumeRandomnessInstruction,
-  createCloseRequestInstruction,
+  createInitializeInstruction,
+  createCreateSubscriptionInstruction,
+  createFundSubscriptionInstruction,
+  createAddConsumerInstruction,
+  createRemoveConsumerInstruction,
+  createCancelSubscriptionInstruction,
 } from "@moirae-vrf/sdk";
 ```
 
@@ -89,18 +94,27 @@ Use these when building custom transactions (e.g., combining with priority fees 
 ### PDA Derivation
 
 ```ts
-import { getConfigPda, getRequestPda } from "@moirae-vrf/sdk";
+import { getConfigPda, getSubscriptionPda, getConsumerPda, getRequestPda } from "@moirae-vrf/sdk";
 
 const [configPda, configBump] = getConfigPda(programId);
+const [subPda, subBump] = getSubscriptionPda(subscriptionId, programId);
+const [consumerPda, consumerBump] = getConsumerPda(subscriptionId, consumerProgramId, programId);
 const [requestPda, requestBump] = getRequestPda(requestId, programId);
 ```
 
 ### Account Deserialization
 
 ```ts
-import { decodeVrfConfig, decodeRandomnessRequest } from "@moirae-vrf/sdk";
+import {
+  decodeCoordinatorConfig,
+  decodeSubscription,
+  decodeConsumerRegistration,
+  decodeRandomnessRequest,
+} from "@moirae-vrf/sdk";
 
-const config = decodeVrfConfig(Buffer.from(accountInfo.data));
+const config = decodeCoordinatorConfig(Buffer.from(accountInfo.data));
+const subscription = decodeSubscription(Buffer.from(accountInfo.data));
+const registration = decodeConsumerRegistration(Buffer.from(accountInfo.data));
 const request = decodeRandomnessRequest(Buffer.from(accountInfo.data));
 ```
 
@@ -109,10 +123,10 @@ const request = decodeRandomnessRequest(Buffer.from(accountInfo.data));
 ```ts
 import { waitForFulfillment, addPriorityFee } from "@moirae-vrf/sdk";
 
-// Poll for fulfillment
+// Poll for fulfillment (note: request PDAs are closed after callback delivery)
 const request = await waitForFulfillment(connection, requestId, programId, {
-  timeout: 60_000,
-  interval: 1_000,
+  timeout: 30_000,
+  interval: 2_000,
 });
 
 // Add priority fee instructions
@@ -124,41 +138,29 @@ const feeIxs = addPriorityFee(1000, 200_000); // 1000 micro-lamports, 200k CU li
 ```ts
 import {
   RequestStatus,
-  VrfConfig,
+  CoordinatorConfig,
+  SubscriptionAccount,
+  ConsumerRegistrationAccount,
   RandomnessRequestAccount,
-  RequestRandomnessResult,
-  GetRandomnessOptions,
-  GetRandomnessResult,
+  CreateSubscriptionResult,
+  RequestRandomWordsResult,
   WaitForFulfillmentOptions,
 } from "@moirae-vrf/sdk";
 ```
 
-## ZK Compressed Mode (Zero Rent)
-
-For high-volume use cases, use compressed mode to eliminate rent costs entirely:
+### Constants
 
 ```ts
-import { MoiraeVrf, fetchCompressedRequests } from "@moirae-vrf/sdk";
-
-const vrf = new MoiraeVrf(connection);
-vrf.setPhotonRpcUrl("https://devnet.helius-rpc.com/?api-key=YOUR_KEY");
-
-// Fetch all compressed requests
-const requests = await vrf.getCompressedRequests();
-
-// Wait for a compressed request to be fulfilled
-const result = await vrf.waitForCompressedFulfillment(requestId, {
-  timeout: 60_000,
-});
-console.log("Randomness:", Buffer.from(result.randomness).toString("hex"));
+import {
+  VRF_PROGRAM_ID,
+  DISCRIMINATORS,
+  ACCOUNT_DISCRIMINATORS,
+  COORDINATOR_CONFIG_SIZE,
+  SUBSCRIPTION_SIZE,
+  CONSUMER_REGISTRATION_SIZE,
+  RANDOMNESS_REQUEST_SIZE,
+} from "@moirae-vrf/sdk";
 ```
-
-Compressed requests use Light Protocol's ZK Compression:
-- **Zero rent** — no SOL locked per request
-- **2-step lifecycle** — request → fulfill (no consume/close needed)
-- **Same security** — Ed25519 verification is identical to regular mode
-
-Requires `@lightprotocol/stateless.js` as an optional peer dependency for full transaction construction.
 
 ## Build
 

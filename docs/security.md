@@ -13,15 +13,15 @@ The oracle operator controls:
 
 1. **Submit arbitrary randomness** — The on-chain program cryptographically verifies that the randomness was signed by the configured authority key. The oracle must produce a valid Ed25519 signature.
 2. **Modify past outputs** — Once a request is fulfilled on-chain, the randomness is immutable.
-3. **Double-fulfill** — The program enforces status transitions (Pending → Fulfilled → Consumed → Closed). A request can only be fulfilled once.
+3. **Double-fulfill** — The program enforces status transitions (Pending → Fulfilled). A request can only be fulfilled once. The request PDA is closed after fulfillment.
 
 ### On-Chain Verification
 
 Every fulfillment transaction includes a native Ed25519 signature-verify instruction. The program introspects the Instructions sysvar to verify:
 
-- The instruction at index 0 targets the Ed25519 precompile
+- An Ed25519 precompile instruction exists (scans up to 8 instructions)
 - Exactly 1 signature is present
-- The public key matches `VrfConfiguration.authority`
+- The public key matches `CoordinatorConfig.authority`
 - The signed message matches `request_id || randomness`
 - All offset indices are self-referencing (`0xFFFF`)
 
@@ -85,6 +85,8 @@ AUTHORITY_KEYPAIR_PATH=/path/to/new-authority.json
 | Requester manipulates seed | No impact | Seed is mixed into HMAC input alongside slot and ID |
 | Request replay | Yes | Each request has a unique monotonic ID |
 | Front-running | Minimal | Oracle uses the request_slot (committed on-chain) as HMAC input |
+| Unauthorized callback | Yes | Coordinator PDA signs callbacks; consumers verify the signer |
+| Subscription draining | Yes | Only registered consumers can request; fee deducted per request |
 
 *If the HMAC secret is leaked, the oracle's randomness becomes predictable. However, the Ed25519 signature still prevents unauthorized parties from fulfilling requests.
 
