@@ -4,6 +4,7 @@
   "private": true,
   "description": "Moirae VRF configuration & management scripts",
   "scripts": {
+    "initialize": "ts-node initialize-vrf.ts",
     "register": "ts-node register-consumer.ts"
   },
   "dependencies": {
