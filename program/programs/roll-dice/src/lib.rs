@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-declare_id!("7Q5b9aimnHmR8ooooRqxgfYfnLmPi6qrVR9GrJ1b6fDp");
+declare_id!("8dYRQi4Ai7Am1oWArpHHQYoC11FGyfNVJ7FU9Rwtrvbv");
 
 /// Game configuration storing the coordinator program and subscription.
 ///

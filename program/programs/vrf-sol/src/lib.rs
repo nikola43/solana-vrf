@@ -8,7 +8,7 @@ pub mod state;
 
 use instructions::*;
 
-declare_id!("A4pDDsKvtX2U3jyEURVSoH15Mx4JcgUiSqCKxqWE3N48");
+declare_id!("GyTSsNWHUfvmjuz8WfiSM7SrT7a4e9aqe2PR2MkPXKQF");
 
 /// Solana VRF Coordinator (Chainlink VRF v2-style).
 ///

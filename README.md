@@ -372,6 +372,37 @@ yarn lint        # Check
 yarn lint:fix    # Auto-fix
 ```
 
+## Docker (build / test / deploy)
+
+The repo includes a `docker-compose.yml` that uses **official Solana Foundation images** ([hub.docker.com/u/solanafoundation](https://hub.docker.com/u/solanafoundation)) for building, testing, and deploying the program.
+
+| Profile | Service | Description |
+|--------|---------|-------------|
+| `build` | `program-build` | Build the Anchor program (`anchor build`) |
+| `test` | `program-test` | Run full test suite (validator + `anchor test`); creates `backend/vrf-signer.json` if missing |
+| `deploy-devnet` | `program-deploy-devnet` | Build and deploy to devnet (requires deploy keypair) |
+| `verifiable` | `program-verifiable-build` | Deterministic/verifiable build via `solanafoundation/solana-verifiable-build` |
+| `localnet` | `solana-test-validator` | Standalone local RPC validator on port 8899 |
+
+**Examples:**
+
+```bash
+# Build only
+docker compose --profile build run --rm program-build
+
+# Run all program tests
+docker compose --profile test run --rm program-test
+
+# Deploy to devnet (set DEPLOYER_KEYPAIR to path to your keypair JSON)
+export DEPLOYER_KEYPAIR=./path/to/id.json
+docker compose --profile deploy-devnet run --rm program-deploy-devnet
+
+# Start local validator only
+docker compose --profile localnet up -d solana-test-validator
+```
+
+For devnet deploy, ensure `Anchor.toml` `[provider]` (or `ANCHOR_PROVIDER_URL`) points to your desired RPC and the mounted keypair has devnet SOL.
+
 ## Project Structure
 
 ```
