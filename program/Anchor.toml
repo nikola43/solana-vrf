@@ -7,7 +7,7 @@ skip-lint = false
 
 [programs.devnet]
 roll_dice = "8dYRQi4Ai7Am1oWArpHHQYoC11FGyfNVJ7FU9Rwtrvbv"
-vrf_sol = "GyTSsNWHUfvmjuz8WfiSM7SrT7a4e9aqe2PR2MkPXKQF"
+vrf_sol = "GiAoN2BZjJVHD91X1GqB4744pb2y1Qt1VgxUmkVrXcQM"
 
 [programs.localnet]
 roll_dice = "7Q5b9aimnHmR8ooooRqxgfYfnLmPi6qrVR9GrJ1b6fDp"
@@ -17,7 +17,7 @@ vrf_sol = "A4pDDsKvtX2U3jyEURVSoH15Mx4JcgUiSqCKxqWE3N48"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "https://devnet.helius-rpc.com/?api-key=e26bf879-6bb4-49c0-aafa-8e4d86687455"
+cluster = "https://api.devnet.solana.com"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
