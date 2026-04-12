@@ -7,7 +7,7 @@ skip-lint = false
 
 [programs.devnet]
 roll_dice = "8dYRQi4Ai7Am1oWArpHHQYoC11FGyfNVJ7FU9Rwtrvbv"
-vrf_sol = "GiAoN2BZjJVHD91X1GqB4744pb2y1Qt1VgxUmkVrXcQM"
+vrf_sol = "531CgBXgrP1QxbQ4bfBj4ddqERp7eBWRxRNxZzNKVkT5"
 
 [programs.localnet]
 roll_dice = "7Q5b9aimnHmR8ooooRqxgfYfnLmPi6qrVR9GrJ1b6fDp"
